@@ -152,7 +152,7 @@ class CharRangeProcessor(LogitsProcessor):
                 # 文末強制: 範囲内かつテキストが文末文字で終わっていればEOSを強制
                 if self.use_sent_end_force and text and text[-1] in SENT_END_CHARS:
                     for sid in self.stop_ids:
-                        scores[b, sid] = float("inf")
+                        scores[b, sid] = 1e9
                 # ソフト: 帯後半でストップのロジットを押し上げ自然に締めさせる
                 elif self.use_soft_boost and used >= self.soft_start:
                     for sid in self.stop_ids:
@@ -642,6 +642,14 @@ def print_summary(summary):
 # 実行例
 # ----------------------------------------------------------------------------
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--reset", action="store_true", help="チェックポイントを削除して最初から実行する")
+    args = parser.parse_args()
+    if args.reset and os.path.exists(CHECKPOINT_PATH):
+        os.remove(CHECKPOINT_PATH)
+        print(f"[checkpoint] reset — removed {CHECKPOINT_PATH}")
+
     SAMPLE = (
         "近年の機械学習システムでは、大規模言語モデルを用いた要約や情報抽出が"
         "実運用に投入されつつある。GPT系やLLaMA系をはじめとする多様なアーキテクチャが"
