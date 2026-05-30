@@ -17,6 +17,9 @@ uv.lock
 ~/.cache/char_budget/
 *.pt
 
+# 実験チェックポイント
+checkpoint.json
+
 # macOS
 .DS_Store
 
