@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+dist/
+*.egg-info/
+
+# uv
+.python-version
+uv.lock
+
+# 環境変数
+.env
+
+# モデルキャッシュ
+~/.cache/char_budget/
+*.pt
+
+# macOS
+.DS_Store
+
+# エディタ
+.vscode/
+.idea/
