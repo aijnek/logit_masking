@@ -32,7 +32,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, LogitsProcessor
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    LogitsProcessor,
+    StoppingCriteria,
+    StoppingCriteriaList,
+)
 
 # ----------------------------------------------------------------------------
 # 設定
@@ -43,6 +49,11 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 
 SENT_END_CHARS = frozenset("。！？")
 QUALITY_END_CHARS = frozenset("。！？…」")
+
+# 締め句注入方式 (closing_inject)
+CLOSING_TEXT = "最後に、"
+CLOSING_TEXT_SHORT = "1文でまとめると、"  # lower < TRIGGER_MARGIN の短バンド用
+TRIGGER_MARGIN = 55  # 下限から何文字手前で注入トリガ窓を開けるか（平均1文≈52字分を確保）
 
 
 def pick_device():
@@ -63,6 +74,22 @@ DTYPE = torch.float16 if DEVICE.type in ("mps", "cuda") else torch.float32
 def count_chars(text: str) -> int:
     """空白を除いた文字数。str.isspace() は全角スペース U+3000 も True。"""
     return sum(1 for c in text if not c.isspace())
+
+
+def strip_closing(text: str, closing: str = CLOSING_TEXT) -> str:
+    """注入した締め句を可視テキストから除去。
+
+    位置を「句点直後」または「文頭」に限定し、モデルが本文中に書いた
+    "最後に〜" を巻き込まないようにする。
+    """
+    text = text.replace("。" + closing, "。")
+    if text.startswith(closing):
+        text = text[len(closing):]
+    return text
+
+
+def visible_text(raw: str, closing: str = CLOSING_TEXT) -> str:
+    return strip_closing(raw, closing).strip()
 
 
 # ----------------------------------------------------------------------------
@@ -173,6 +200,74 @@ class CharRangeProcessor(LogitsProcessor):
 
 
 # ----------------------------------------------------------------------------
+# 締め句注入用 LogitsProcessor / StoppingCriteria
+# ----------------------------------------------------------------------------
+class ClosingInjectProcessor(LogitsProcessor):
+    """締め句注入方式専用。下限EOS禁止のみを担当（上限介入なし）。
+
+    used は decode 後に strip_closing で締め句を剥がした「可視文字数」で数える。
+    注入済み (injected=True) になったら EOS 禁止を解除する。
+    """
+
+    def __init__(self, lower, upper, prompt_len, tokenizer, stop_ids,
+                 closing_text=CLOSING_TEXT):
+        self.lower = lower
+        self.upper = upper
+        self.prompt_len = prompt_len
+        self.tok = tokenizer
+        self.stop_ids = list(stop_ids)
+        self.closing_text = closing_text
+        self.injected = False
+
+    def set_injected(self, flag: bool):
+        self.injected = flag
+
+    def __call__(self, input_ids, scores):
+        for b in range(input_ids.shape[0]):
+            gen = input_ids[b, self.prompt_len:]
+            text = self.tok.decode(gen, skip_special_tokens=True)
+            vis = strip_closing(text, self.closing_text)
+            used = count_chars(vis)
+
+            if not self.injected and used < self.lower:
+                for sid in self.stop_ids:
+                    scores[b, sid] = float("-inf")
+
+            if scores[b].max() == float("-inf"):
+                for sid in self.stop_ids:
+                    scores[b, sid] = 0.0
+        return scores
+
+
+class ClosingInjectStopping(StoppingCriteria):
+    """締め句注入のトリガ。直前が句点 & 可視 used が [lower - margin, lower] の窓内で停止。"""
+
+    def __init__(self, lower, upper, trigger_margin, prompt_len, tokenizer,
+                 closing_text=CLOSING_TEXT):
+        self.lower = lower
+        self.upper = upper
+        self.prompt_len = prompt_len
+        self.tok = tokenizer
+        self.closing_text = closing_text
+        self.trigger_lo = lower - trigger_margin
+        self.triggered = False
+
+    def __call__(self, input_ids, scores, **kwargs) -> bool:
+        if self.triggered:
+            return False
+        gen = input_ids[0, self.prompt_len:]
+        text = self.tok.decode(gen, skip_special_tokens=True)
+        vis = strip_closing(text, self.closing_text).rstrip()
+        if not vis or vis[-1] not in SENT_END_CHARS:
+            return False
+        used = count_chars(vis)
+        if self.trigger_lo <= used <= self.lower:
+            self.triggered = True
+            return True
+        return False
+
+
+# ----------------------------------------------------------------------------
 # モデル読み込み
 # ----------------------------------------------------------------------------
 print(f"[load] device={DEVICE} dtype={DTYPE} model={MODEL_ID}")
@@ -193,6 +288,16 @@ if isinstance(_im_end, int) and _im_end >= 0:
     STOP_IDS.add(_im_end)
 STOP_IDS = sorted(STOP_IDS)
 
+# 締め句のトークン化が想定どおりかを起動時に1度確認（境界トークン問題の検知）
+_closing_ids = tokenizer(CLOSING_TEXT, add_special_tokens=False).input_ids
+_closing_decoded = tokenizer.decode(_closing_ids)
+print(f"[closing] text={CLOSING_TEXT!r} ids={_closing_ids} decoded={_closing_decoded!r}"
+      f" {'OK' if _closing_decoded == CLOSING_TEXT else 'MISMATCH!'}")
+_closing_short_ids = tokenizer(CLOSING_TEXT_SHORT, add_special_tokens=False).input_ids
+_closing_short_decoded = tokenizer.decode(_closing_short_ids)
+print(f"[closing_short] text={CLOSING_TEXT_SHORT!r} ids={_closing_short_ids} decoded={_closing_short_decoded!r}"
+      f" {'OK' if _closing_short_decoded == CLOSING_TEXT_SHORT else 'MISMATCH!'}")
+
 
 @torch.no_grad()
 def is_natural_ending(text: str) -> tuple[bool, str]:
@@ -205,10 +310,10 @@ def is_natural_ending(text: str) -> tuple[bool, str]:
     messages = [
         {"role": "system", "content": "あなたは日本語文章の品質を評価する専門家です。"},
         {"role": "user", "content": (
-            "以下の文章の末尾は自然に終わっていますか？\n"
-            "途中で唐突に切れていたり、文脈が続くのに終わっているような"
-            "不自然な終わり方の場合は「いいえ」、\n"
-            "自然に文が完結している場合は「はい」と一語で答えてください。\n\n"
+            "以下の文章の末尾は文法的に完結していますか？\n"
+            "内容の充実度や情報量は問いません。文末の語尾・句読点・助詞・動詞の活用形だけを見て、\n"
+            "文が途中の単語で切れている場合（例：「提案す」「改善さ」「効果的な」など）は「いいえ」、\n"
+            "句点・感嘆符・疑問符・引用符で終わっているか、名詞・動詞・形容詞として文法的に完結している場合は「はい」と一語で答えてください。\n\n"
             f"文章:\n「{text}」\n\n"
             "回答（はい／いいえ）:"
         )},
@@ -258,6 +363,8 @@ class GenResult:
     ends_with_punct: bool
     is_natural: bool | None       # None if punct check failed (natural check skipped)
     natural_raw: str | None       # raw model output from is_natural_ending; None if not called
+    injected: bool | None = None  # closing_inject 条件のみ True/False、他条件は None
+    visible: str | None = None    # 締め句除去後の可視テキスト（closing_inject のみ）
 
 
 @dataclass
@@ -327,6 +434,128 @@ def generate_one(text, lower, upper, *, hard, soft, floor,
     )
 
 
+@torch.no_grad()
+def generate_one_with_closing(text, lower, upper, *,
+                              trigger_margin=TRIGGER_MARGIN,
+                              closing=CLOSING_TEXT,
+                              temperature=0.7, top_p=0.8) -> GenResult:
+    """締め句注入方式の2段階生成。
+
+    Phase 1: 下限EOS禁止のみ + StoppingCriteria。窓内の句点で停止
+    Phase 2: input_ids に締め句を append し、フロア解除して続きを生成
+
+    トリガが一度も発火しなければ Phase 1 だけで完了（注入なし）。
+    """
+    prompt = build_prompt(text, lower, upper)
+    enc = tokenizer(prompt, return_tensors="pt").to(DEVICE)
+    prompt_len = enc.input_ids.shape[1]
+
+    injected = False
+    # lower が trigger_margin より小さい場合、最初から締め句を付加して Phase 2 のみ実行
+    if lower < trigger_margin:
+        closing = CLOSING_TEXT_SHORT
+    proc = ClosingInjectProcessor(
+        lower, upper, prompt_len, tokenizer, STOP_IDS, closing_text=closing,
+    )
+
+    if lower < trigger_margin:
+        closing_ids = tokenizer(
+            closing, add_special_tokens=False, return_tensors="pt",
+        ).input_ids.to(DEVICE)
+        new_input = torch.cat([enc.input_ids, closing_ids], dim=1)
+        # set_injected しない: Phase 2 でも下限 EOS 禁止を維持して lower を保証
+        attention_mask = torch.ones_like(new_input)
+        remaining_chars = upper
+        phase2_max_new = max(64, remaining_chars * 2 + 32)
+        out2 = model.generate(
+            input_ids=new_input,
+            attention_mask=attention_mask,
+            max_new_tokens=phase2_max_new,
+            do_sample=True,
+            temperature=temperature,
+            top_p=top_p,
+            logits_processor=[proc],
+            eos_token_id=STOP_IDS if STOP_IDS else None,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+        gen_ids = out2[0, prompt_len:]
+        injected = True
+    else:
+        stop = ClosingInjectStopping(
+            lower, upper, trigger_margin, prompt_len, tokenizer, closing_text=closing,
+        )
+        out1 = model.generate(
+            **enc,
+            max_new_tokens=upper + 64,
+            do_sample=True,
+            temperature=temperature,
+            top_p=top_p,
+            logits_processor=[proc],
+            stopping_criteria=StoppingCriteriaList([stop]),
+            eos_token_id=STOP_IDS if STOP_IDS else None,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+        if stop.triggered:
+            closing_ids = tokenizer(
+                closing, add_special_tokens=False, return_tensors="pt",
+            ).input_ids.to(DEVICE)
+            new_input = torch.cat([out1, closing_ids], dim=1)
+            proc.set_injected(True)
+            attention_mask = torch.ones_like(new_input)
+            # 残予算ベース（vis ベースで残り文字数を測り、安全に余裕を持たせる）
+            vis_so_far = strip_closing(
+                tokenizer.decode(out1[0, prompt_len:], skip_special_tokens=True),
+                closing,
+            )
+            remaining_chars = max(0, upper - count_chars(vis_so_far))
+            # 日本語は1トークン~1〜2文字。余裕を取って *2 + バッファ
+            phase2_max_new = max(64, remaining_chars * 2 + 32)
+            out2 = model.generate(
+                input_ids=new_input,
+                attention_mask=attention_mask,
+                max_new_tokens=phase2_max_new,
+                do_sample=True,
+                temperature=temperature,
+                top_p=top_p,
+                logits_processor=[proc],
+                eos_token_id=STOP_IDS if STOP_IDS else None,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+            gen_ids = out2[0, prompt_len:]
+            injected = True
+        else:
+            gen_ids = out1[0, prompt_len:]
+
+    raw = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+    vis = visible_text(raw, closing)
+
+    vis_n = count_chars(vis)
+    vis_in_range = lower <= vis_n <= upper
+    trimmed = trim_to_range(vis, lower, upper)
+    ewp = ends_with_sentence_punct(vis)
+    if ewp:
+        is_nat, nat_raw = is_natural_ending(vis)
+    else:
+        is_nat, nat_raw = None, None
+
+    accepted = (trimmed is not None) and ewp and (is_nat is True)
+    trimmed_text = trimmed if trimmed is not None else vis
+    return GenResult(
+        text=raw,
+        raw_chars=vis_n,
+        raw_in_range=vis_in_range,
+        trimmed=trimmed_text,
+        trimmed_chars=count_chars(trimmed_text),
+        accepted=accepted,
+        needed_trim=(trimmed is not None) and (vis_n > upper),
+        ends_with_punct=ewp,
+        is_natural=is_nat,
+        natural_raw=nat_raw,
+        injected=injected,
+        visible=vis,
+    )
+
+
 # ----------------------------------------------------------------------------
 # 実験ハーネス: 条件ごとに K サンプルを取り、合格率と必要 N を比較
 # ----------------------------------------------------------------------------
@@ -336,6 +565,8 @@ CONDITIONS = {
     "hard_soft":  dict(hard=True,  soft=True,  floor=True),
     "floor_sent": dict(hard=False, soft=True,  floor=True,
                        soft_frac=0.0, boost=1.5, sent_end_force=True),
+    "closing_inject": {"__mode__": "closing",
+                       "trigger_margin": TRIGGER_MARGIN, "closing": CLOSING_TEXT},
 }
 
 
@@ -363,6 +594,8 @@ def _record_from_dict(d: dict) -> "SampleRecord":
         ends_with_punct=r["ends_with_punct"],
         is_natural=r["is_natural"],
         natural_raw=r["natural_raw"],
+        injected=r.get("injected"),
+        visible=r.get("visible"),
     )
     return SampleRecord(
         cond=d["cond"],
@@ -449,7 +682,11 @@ def run_experiment(tasks, K=8):
             center = (lower + upper) / 2
             for k in range(1, K + 1):
                 t_s = time.time()
-                r = generate_one(text, lower, upper, **flags)
+                if flags.get("__mode__") == "closing":
+                    f = {k2: v for k2, v in flags.items() if k2 != "__mode__"}
+                    r = generate_one_with_closing(text, lower, upper, **f)
+                else:
+                    r = generate_one(text, lower, upper, **flags)
                 elapsed = time.time() - t_s
                 n_total += 1
                 grand_done += 1
@@ -690,6 +927,7 @@ if __name__ == "__main__":
         (SAMPLE, 280, 400),
         (SAMPLE, 140, 200),
         (SAMPLE, 70, 100),
+        (SAMPLE, 49, 70),
     ]
 
     summary, records = run_experiment(tasks, K=8)
