@@ -8,9 +8,10 @@
   - 後段   : 文境界トリムで上限を最終保証。範囲外なら再生成。
 
 比較できる条件:
-  baseline   : 介入なし（プロンプトのみ＝現状の素の best-of-N 相当）
-  hard_only  : 上限ハードマスク ＋ 下限 EOS 禁止（ソフトブーストなし）
-  hard_soft  : hard_only ＋ ソフト EOS ブースト
+  baseline    : 介入なし（プロンプトのみ＝現状の素の best-of-N 相当）
+  hard_only   : 上限ハードマスク ＋ 下限 EOS 禁止（ソフトブーストなし）
+  hard_soft   : hard_only ＋ ソフト EOS ブースト
+  floor_sent  : 下限 EOS 禁止 ＋ 弱いソフトブースト（下限直後から）＋ 文末強制 EOS（ハードマスクなし）
 
 文字数定義: 空白を除く Unicode コードポイント数（全角/半角の区別なし・記号は数える）。
 
@@ -19,11 +20,13 @@
   まず MODEL_ID を "Qwen/Qwen3-1.7B" などに変えてハーネスを検証してください。
 """
 
+import json
+import math
 import os
 import re
 import time
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -37,6 +40,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, LogitsProcessor
 MODEL_ID = "Qwen/Qwen3.5-9B"     # 検証時は "Qwen/Qwen3-1.7B" 等に差し替え推奨
 CACHE_DIR = os.path.expanduser("~/.cache/char_budget")
 os.makedirs(CACHE_DIR, exist_ok=True)
+
+SENT_END_CHARS = frozenset("。！？")
+QUALITY_END_CHARS = frozenset("。！？…」")
 
 
 def pick_device():
@@ -76,6 +82,11 @@ def trim_to_range(text: str, lower: int, upper: int):
     return out if lower <= n <= upper else None
 
 
+def ends_with_sentence_punct(text: str) -> bool:
+    stripped = text.rstrip()
+    return bool(stripped) and stripped[-1] in QUALITY_END_CHARS
+
+
 # ----------------------------------------------------------------------------
 # トークン別 非空白文字数テーブル（保守的上限）。重いのでディスクキャッシュ。
 # ----------------------------------------------------------------------------
@@ -108,7 +119,8 @@ def build_nonspace_len(tokenizer) -> torch.Tensor:
 class CharRangeProcessor(LogitsProcessor):
     def __init__(self, lower, upper, prompt_len, tokenizer, nonspace_len,
                  stop_ids, *, use_hard_mask=True, use_soft_boost=True,
-                 use_lower_floor=True, soft_frac=0.7, boost=4.0):
+                 use_lower_floor=True, soft_frac=0.7, boost=4.0,
+                 use_sent_end_force=False):
         self.lower = lower
         self.upper = upper
         self.prompt_len = prompt_len
@@ -121,6 +133,7 @@ class CharRangeProcessor(LogitsProcessor):
         # ソフトブーストは [lower, upper] 帯の後半から効かせる
         self.soft_start = lower + soft_frac * (upper - lower)
         self.boost = boost
+        self.use_sent_end_force = use_sent_end_force
 
     def __call__(self, input_ids, scores):
         nslen = self.nonspace_len.to(scores.device)
@@ -135,10 +148,15 @@ class CharRangeProcessor(LogitsProcessor):
             if self.use_lower_floor and used < self.lower:
                 for sid in self.stop_ids:
                     scores[b, sid] = float("-inf")
-            # ソフト: 帯後半でストップのロジットを押し上げ自然に締めさせる
-            elif self.use_soft_boost and used >= self.soft_start:
-                for sid in self.stop_ids:
-                    scores[b, sid] += self.boost
+            else:
+                # 文末強制: 範囲内かつテキストが文末文字で終わっていればEOSを強制
+                if self.use_sent_end_force and text and text[-1] in SENT_END_CHARS:
+                    for sid in self.stop_ids:
+                        scores[b, sid] = float("inf")
+                # ソフト: 帯後半でストップのロジットを押し上げ自然に締めさせる
+                elif self.use_soft_boost and used >= self.soft_start:
+                    for sid in self.stop_ids:
+                        scores[b, sid] += self.boost
 
             # 上限: オーバーしうるトークンを禁止（stop は nslen=0 なので生き残る）
             if self.use_hard_mask:
@@ -146,6 +164,11 @@ class CharRangeProcessor(LogitsProcessor):
                 if nslen.shape[0] < vocab_size:
                     nslen = torch.nn.functional.pad(nslen, (0, vocab_size - nslen.shape[0]))
                 scores[b, nslen[:vocab_size] > remaining] = float("-inf")
+
+            # 安全弁: 全トークンが -inf になった場合は stop トークンを解放して無限ループを防ぐ
+            if scores[b].max() == float("-inf"):
+                for sid in self.stop_ids:
+                    scores[b, sid] = 0.0
         return scores
 
 
@@ -171,6 +194,45 @@ if isinstance(_im_end, int) and _im_end >= 0:
 STOP_IDS = sorted(STOP_IDS)
 
 
+@torch.no_grad()
+def is_natural_ending(text: str) -> tuple[bool, str]:
+    """文末が自然に終わっているかQwen3.5-9B自身に判定させる。
+    戻り値: (判定結果, モデルの生の出力)
+    - True: 自然な終わり
+    - False: 不自然（途中切れ等）
+    - Trueフォールバック: モデルが「はい」「いいえ」以外を返した場合も True だが nat_raw で確認可能
+    """
+    messages = [
+        {"role": "system", "content": "あなたは日本語文章の品質を評価する専門家です。"},
+        {"role": "user", "content": (
+            "以下の文章の末尾は自然に終わっていますか？\n"
+            "途中で唐突に切れていたり、文脈が続くのに終わっているような"
+            "不自然な終わり方の場合は「いいえ」、\n"
+            "自然に文が完結している場合は「はい」と一語で答えてください。\n\n"
+            f"文章:\n「{text}」\n\n"
+            "回答（はい／いいえ）:"
+        )},
+    ]
+    prompt_str = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    enc = tokenizer(prompt_str, return_tensors="pt").to(DEVICE)
+    out = model.generate(
+        **enc,
+        max_new_tokens=8,
+        do_sample=False,
+        pad_token_id=tokenizer.eos_token_id,
+    )
+    gen_ids = out[0, enc.input_ids.shape[1]:]
+    answer = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+    if "いいえ" in answer:
+        return False, answer
+    if "はい" in answer:
+        return True, answer
+    return True, answer  # 解析不能: 保守的に合格、nat_raw で人間が確認できる
+
+
 def build_prompt(text: str, lower: int, upper: int) -> str:
     messages = [
         {"role": "system", "content": "あなたは優秀な要約者です。"},
@@ -193,6 +255,9 @@ class GenResult:
     trimmed_chars: int
     accepted: bool
     needed_trim: bool
+    ends_with_punct: bool
+    is_natural: bool | None       # None if punct check failed (natural check skipped)
+    natural_raw: str | None       # raw model output from is_natural_ending; None if not called
 
 
 @dataclass
@@ -208,16 +273,18 @@ class SampleRecord:
 
 @torch.no_grad()
 def generate_one(text, lower, upper, *, hard, soft, floor,
+                 soft_frac=0.7, boost=4.0, sent_end_force=False,
                  temperature=0.7, top_p=0.8) -> GenResult:
     prompt = build_prompt(text, lower, upper)
     enc = tokenizer(prompt, return_tensors="pt").to(DEVICE)
     prompt_len = enc.input_ids.shape[1]
 
     processors = []
-    if hard or soft or floor:
+    if hard or soft or floor or sent_end_force:
         processors.append(CharRangeProcessor(
             lower, upper, prompt_len, tokenizer, NONSPACE_LEN, STOP_IDS,
             use_hard_mask=hard, use_soft_boost=soft, use_lower_floor=floor,
+            soft_frac=soft_frac, boost=boost, use_sent_end_force=sent_end_force,
         ))
 
     out = model.generate(
@@ -237,8 +304,15 @@ def generate_one(text, lower, upper, *, hard, soft, floor,
     raw_in_range = lower <= raw_n <= upper
 
     trimmed = trim_to_range(raw, lower, upper)
-    accepted = trimmed is not None
-    trimmed_text = trimmed if accepted else raw
+
+    ewp = ends_with_sentence_punct(raw)
+    if ewp:
+        is_nat, nat_raw = is_natural_ending(raw)
+    else:
+        is_nat, nat_raw = None, None
+
+    accepted = (trimmed is not None) and ewp and (is_nat is True)
+    trimmed_text = trimmed if trimmed is not None else raw
     return GenResult(
         text=raw,
         raw_chars=raw_n,
@@ -246,7 +320,10 @@ def generate_one(text, lower, upper, *, hard, soft, floor,
         trimmed=trimmed_text,
         trimmed_chars=count_chars(trimmed_text),
         accepted=accepted,
-        needed_trim=accepted and (raw_n > upper),
+        needed_trim=(trimmed is not None) and (raw_n > upper),
+        ends_with_punct=ewp,
+        is_natural=is_nat,
+        natural_raw=nat_raw,
     )
 
 
@@ -254,10 +331,76 @@ def generate_one(text, lower, upper, *, hard, soft, floor,
 # 実験ハーネス: 条件ごとに K サンプルを取り、合格率と必要 N を比較
 # ----------------------------------------------------------------------------
 CONDITIONS = {
-    "baseline":  dict(hard=False, soft=False, floor=False),
-    "hard_only": dict(hard=True,  soft=False, floor=True),
-    "hard_soft": dict(hard=True,  soft=True,  floor=True),
+    "baseline":   dict(hard=False, soft=False, floor=False),
+    "hard_only":  dict(hard=True,  soft=False, floor=True),
+    "hard_soft":  dict(hard=True,  soft=True,  floor=True),
+    "floor_sent": dict(hard=False, soft=True,  floor=True,
+                       soft_frac=0.0, boost=1.5, sent_end_force=True),
 }
+
+
+CHECKPOINT_PATH = "checkpoint.json"
+
+
+def _record_to_dict(rec: "SampleRecord") -> dict:
+    d = asdict(rec)
+    # float("nan") is not valid JSON; replace with null
+    if math.isnan(d["result"].get("is_natural") or 0.0):
+        pass  # is_natural is bool|None, not float — no action needed
+    return d
+
+
+def _record_from_dict(d: dict) -> "SampleRecord":
+    r = d["result"]
+    gen = GenResult(
+        text=r["text"],
+        raw_chars=r["raw_chars"],
+        raw_in_range=r["raw_in_range"],
+        trimmed=r["trimmed"],
+        trimmed_chars=r["trimmed_chars"],
+        accepted=r["accepted"],
+        needed_trim=r["needed_trim"],
+        ends_with_punct=r["ends_with_punct"],
+        is_natural=r["is_natural"],
+        natural_raw=r["natural_raw"],
+    )
+    return SampleRecord(
+        cond=d["cond"],
+        task_i=d["task_i"],
+        lower=d["lower"],
+        upper=d["upper"],
+        k=d["k"],
+        result=gen,
+        elapsed=d["elapsed"],
+    )
+
+
+def save_checkpoint(summary: dict, records: list, path: str = CHECKPOINT_PATH):
+    data = {
+        "summary": {
+            k: {kk: (None if isinstance(vv, float) and math.isnan(vv) else vv)
+                for kk, vv in v.items()}
+            for k, v in summary.items()
+        },
+        "records": [_record_to_dict(r) for r in records],
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print(f"[checkpoint] saved → {path}")
+
+
+def load_checkpoint(path: str = CHECKPOINT_PATH) -> tuple[dict, list] | None:
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    summary = {
+        k: {kk: (float("nan") if vv is None and kk == "p_natural" else vv)
+            for kk, vv in v.items()}
+        for k, v in data["summary"].items()
+    }
+    records = [_record_from_dict(d) for d in data["records"]]
+    return summary, records
 
 
 def expected_n(p):
@@ -274,16 +417,31 @@ def run_experiment(tasks, K=8):
     n_tasks = len(tasks)
     total_per_cond = n_tasks * K
     grand_total = n_cond * total_per_cond
-    grand_done = 0
 
-    summary = {}
-    records: list[SampleRecord] = []
+    # チェックポイントがあれば再開
+    ckpt = load_checkpoint()
+    if ckpt is not None:
+        summary, records = ckpt
+        done_conds = set(summary.keys())
+        grand_done = len(records)
+        print(f"[checkpoint] loaded — skipping {done_conds}, resuming from sample {grand_done + 1}")
+    else:
+        summary = {}
+        records = []
+        done_conds = set()
+        grand_done = 0
 
     for cond_i, (cond, flags) in enumerate(CONDITIONS.items(), 1):
+        if cond in done_conds:
+            print(f"\n[{cond_i}/{n_cond}] condition={cond}  SKIP (already in checkpoint)")
+            continue
         n_accept = 0       # トリム後に範囲内（=最終合格）
         n_raw_in = 0       # トリム前から範囲内（=自然収束）
         n_trim = 0         # トリムが発火
         n_total = 0
+        n_punct = 0        # 文末記号チェック合格
+        n_natural = 0      # 自然さチェック合格（はい）
+        n_punct_check = 0  # 自然さチェックを実施したサンプル数
         char_err = 0.0     # 中心からのズレ（参考）
         t0 = time.time()
         print(f"\n[{cond_i}/{n_cond}] condition={cond}  ({total_per_cond} samples)")
@@ -298,13 +456,29 @@ def run_experiment(tasks, K=8):
                 n_accept += int(r.accepted)
                 n_raw_in += int(r.raw_in_range)
                 n_trim += int(r.needed_trim)
+                n_punct += int(r.ends_with_punct)
+                if r.is_natural is not None:
+                    n_punct_check += 1
+                    n_natural += int(r.is_natural)
                 char_err += abs(r.trimmed_chars - center)
                 records.append(SampleRecord(cond, task_i, lower, upper, k, r, elapsed))
                 status = "OK" if r.accepted else "NG"
                 trim_flag = " trim" if r.needed_trim else "     "
+                if not r.accepted:
+                    if not r.ends_with_punct:
+                        qual_flag = " [no-punct]"
+                    elif r.is_natural is False:
+                        qual_flag = " [unnatural]"
+                    elif r.is_natural is True and r.natural_raw is not None and \
+                            "いいえ" not in r.natural_raw and "はい" not in r.natural_raw:
+                        qual_flag = f" [ambiguous: {r.natural_raw!r}]"
+                    else:
+                        qual_flag = ""
+                else:
+                    qual_flag = ""
                 print(
                     f"  task{task_i} k={k}/{K}  chars={r.trimmed_chars:>4} [{lower},{upper}]"
-                    f"  {status}{trim_flag}  {elapsed:.1f}s"
+                    f"  {status}{trim_flag}{qual_flag}  {elapsed:.1f}s"
                     f"  [overall {grand_done}/{grand_total}]"
                 )
         dt = time.time() - t0
@@ -316,9 +490,12 @@ def run_experiment(tasks, K=8):
             trim_rate=n_trim / n_total,
             E_N=expected_n(p_accept),
             mae_center=char_err / n_total,
+            p_punct=n_punct / n_total,
+            p_natural=n_natural / n_punct_check if n_punct_check > 0 else float("nan"),
             n=n_total,
             sec=dt,
         )
+        save_checkpoint(summary, records)
     return summary, records
 
 
@@ -337,6 +514,16 @@ def write_html_report(summary, records: list[SampleRecord], path: str):
         ok_cls = "ok" if r.accepted else "ng"
         trim_badge = '<span class="badge trim">trim</span>' if r.needed_trim else ""
         raw_diff = "" if r.raw_in_range else f'<span class="raw-out">(raw {r.raw_chars})</span>'
+        punct_badge = '<span class="badge ok">✓</span>' if r.ends_with_punct else '<span class="badge ng">✗</span>'
+        if r.is_natural is None:
+            nat_cell = '<span style="color:#aaa">—</span>'
+        elif r.is_natural is True and r.natural_raw is not None and \
+                "いいえ" not in r.natural_raw and "はい" not in r.natural_raw:
+            nat_cell = f'<span style="background:#ff9800;color:white;border-radius:3px;padding:1px 5px;font-size:11px" title="ambiguous">{_esc(r.natural_raw)}</span>'
+        elif r.is_natural:
+            nat_cell = '<span class="badge ok">はい</span>'
+        else:
+            nat_cell = '<span class="badge ng">いいえ</span>'
         rows_html.append(f"""
       <tr class="{ok_cls}">
         <td>{rec.cond}</td>
@@ -345,12 +532,15 @@ def write_html_report(summary, records: list[SampleRecord], path: str):
         <td class="chars">{rec.result.trimmed_chars} {raw_diff}</td>
         <td><span class="badge {ok_cls}">{"OK" if r.accepted else "NG"}</span>{trim_badge}</td>
         <td class="elapsed">{rec.elapsed:.1f}s</td>
+        <td>{punct_badge}</td>
+        <td>{nat_cell}</td>
         <td class="output">{_esc(r.trimmed)}</td>
         <td class="output raw">{_esc(r.text)}</td>
       </tr>""")
 
     summary_rows = []
     for cond, s in summary.items():
+        p_nat_str = f"{s['p_natural']:.2f}" if not math.isnan(s['p_natural']) else "n/a"
         summary_rows.append(f"""
       <tr>
         <td>{cond}</td>
@@ -361,6 +551,8 @@ def write_html_report(summary, records: list[SampleRecord], path: str):
         <td>{best_of_n_success(s['p_accept'], 2):.2f}</td>
         <td>{best_of_n_success(s['p_accept'], 3):.2f}</td>
         <td>{s['mae_center']:.1f}</td>
+        <td>{s['p_punct']:.2f}</td>
+        <td>{p_nat_str}</td>
         <td>{s['sec']:.0f}s</td>
       </tr>""")
 
@@ -396,20 +588,22 @@ def write_html_report(summary, records: list[SampleRecord], path: str):
 <table>
   <thead><tr>
     <th>condition</th><th>p_raw</th><th>p_accept</th><th>trim%</th>
-    <th>E[N]</th><th>P(N≤2)</th><th>P(N≤3)</th><th>MAE</th><th>time</th>
+    <th>E[N]</th><th>P(N≤2)</th><th>P(N≤3)</th><th>MAE</th>
+    <th>p_punct</th><th>p_natural</th><th>time</th>
   </tr></thead>
   <tbody>{"".join(summary_rows)}</tbody>
 </table>
 <p style="font-size:11px;color:#555">
-  p_raw: トリム前から範囲内 / p_accept: トリム後に範囲内 / trim%: 上限トリム発火率 /
-  E[N]: 期待生成回数 / MAE: 帯中心からの平均絶対文字数ズレ
+  p_raw: トリム前から範囲内 / p_accept: トリム後に範囲内（品質チェック込み） / trim%: 上限トリム発火率 /
+  E[N]: 期待生成回数 / MAE: 帯中心からの平均絶対文字数ズレ /
+  p_punct: 文末記号で終わった割合 / p_natural: 自然さ判定で「はい」だった割合（文末記号合格サンプルのみ）
 </p>
 
 <h2>Samples</h2>
 <table>
   <thead><tr>
     <th>condition</th><th>task</th><th>k</th><th>chars</th>
-    <th>status</th><th>time</th>
+    <th>status</th><th>time</th><th>punct</th><th>natural</th>
     <th>trimmed output</th><th>raw output</th>
   </tr></thead>
   <tbody>{"".join(rows_html)}</tbody>
@@ -423,22 +617,25 @@ def write_html_report(summary, records: list[SampleRecord], path: str):
 
 
 def print_summary(summary):
-    print("\n" + "=" * 78)
+    print("\n" + "=" * 96)
     print(f"{'condition':<11} {'p_raw':>7} {'p_accept':>9} {'trim%':>7} "
-          f"{'E[N]':>6} {'P(N=2)':>7} {'P(N=3)':>7} {'MAE':>6}")
-    print("-" * 78)
+          f"{'E[N]':>6} {'P(N=2)':>7} {'P(N=3)':>7} {'MAE':>6} {'p_punct':>8} {'p_nat':>7}")
+    print("-" * 96)
     for cond, s in summary.items():
+        p_nat_str = f"{s['p_natural']:>7.2f}" if not math.isnan(s['p_natural']) else "    n/a"
         print(f"{cond:<11} {s['p_raw']:>7.2f} {s['p_accept']:>9.2f} "
               f"{s['trim_rate']*100:>6.0f}% {s['E_N']:>6.2f} "
               f"{best_of_n_success(s['p_accept'], 2):>7.2f} "
               f"{best_of_n_success(s['p_accept'], 3):>7.2f} "
-              f"{s['mae_center']:>6.1f}")
-    print("=" * 78)
+              f"{s['mae_center']:>6.1f} {s['p_punct']:>8.2f} {p_nat_str}")
+    print("=" * 96)
     print("p_raw    : トリム前から範囲内に着地した割合（自然収束＝ソフトの効果はここ）")
-    print("p_accept : トリム後に範囲内（最終合格率）")
+    print("p_accept : トリム後に範囲内かつ品質チェック合格（最終合格率）")
     print("trim%    : 上限トリムが発火した割合")
     print("E[N]     : 期待生成回数 = 1/p_accept   P(N=k): k回以内に1回成功する確率")
     print("MAE      : 帯中心からの平均絶対文字数ズレ（参考）")
+    print("p_punct  : raw textが文末記号で終わった割合")
+    print("p_nat    : 自然さ判定で「はい」だった割合（文末記号合格サンプルのみ）")
 
 
 # ----------------------------------------------------------------------------
@@ -490,3 +687,6 @@ if __name__ == "__main__":
     summary, records = run_experiment(tasks, K=8)
     print_summary(summary)
     write_html_report(summary, records, "experiment_report.html")
+    if os.path.exists(CHECKPOINT_PATH):
+        os.remove(CHECKPOINT_PATH)
+        print(f"[checkpoint] removed {CHECKPOINT_PATH}")
