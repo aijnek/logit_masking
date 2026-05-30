@@ -52,7 +52,7 @@ QUALITY_END_CHARS = frozenset("。！？…」")
 
 # 締め句注入方式 (closing_inject)
 CLOSING_TEXT = "最後に、"
-CLOSING_TEXT_SHORT = "1文でまとめると、"  # lower < TRIGGER_MARGIN の短バンド用
+CLOSING_TEXT_SHORT = "1文でまとめます。"  # lower < TRIGGER_MARGIN の短バンド用
 TRIGGER_MARGIN = 55  # 下限から何文字手前で注入トリガ窓を開けるか（平均1文≈52字分を確保）
 
 
@@ -343,7 +343,8 @@ def build_prompt(text: str, lower: int, upper: int) -> str:
         {"role": "system", "content": "あなたは優秀な要約者です。"},
         {"role": "user", "content":
             f"次の文章を{lower}〜{upper}文字（空白を除く）で要約してください。"
-            f"結論を先に書き、指定文字数に収めてください。\n\n{text}"},
+            f"結論を先に書き、指定文字数に収めてください。"
+            f"出力には文字数（例：「（50文字）」など）を含めないでください。\n\n{text}"},
     ]
     return tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True,
