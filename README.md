@@ -60,34 +60,64 @@ uv sync
 ## 実行
 
 ```bash
+# 全条件・全タスクを K=8 まで実行（既存分はスキップ）
 uv run python run_experiment.py
 
-# チェックポイントを削除して最初から実行する場合
+# 特定条件・タスクのみ実行
+uv run python run_experiment.py --condition baseline --condition hard_soft --task 1 --task 2
+
+# K を 16 に増やす（k=9〜16 の不足分のみ生成し、k=1〜8 の既存結果を再利用）
+uv run python run_experiment.py --k 16
+
+# 生成せず、ストアから HTML レポートのみ再計算
+uv run python run_experiment.py --report-only
+
+# ストアを削除してゼロから実行（既存結果がすべて消えます）
 uv run python run_experiment.py --reset
 ```
 
 初回実行時にモデルのダウンロードとトークン別文字数テーブルの構築が走ります。テーブルは `~/.cache/char_budget/` にキャッシュされ、2回目以降はスキップされます。
 
-条件ごとに完了した時点で `checkpoint.json` が保存されます。途中でクラッシュしても再実行すれば完了済み条件はスキップして続きから再開できます。全条件完了後、チェックポイントは自動削除されます。
+結果はサンプル単位で `results.jsonl` に追記されます。クラッシュしても再実行で続きから再開できます（`checkpoint.json` 方式を廃止し、自動削除もなくなりました）。
+
+### 再現性について
+
+シードは `derive_seed(base_seed, task_i, k)` で決定論的に導出されます（`BASE_SEED = 1234`、`--seed` で変更可）。全条件が同じ `(task_i, k)` に同じシードを使う「共通乱数法」で、条件間の差を乱数ゆらぎではなく介入由来として切り分けやすくします。
+
+> **注意**: MPS (Apple Silicon) は一部カーネルが非決定的なため、再現性はベストエフォートです。CUDA / CPU では完全再現できます。
+
+### 主なオプション
+
+| オプション | 説明 | デフォルト |
+|---|---|---|
+| `--k N` | 目標サンプル数/タスク（累積） | `8` |
+| `--condition NAME` | 実行する条件名（複数指定可） | 全条件 |
+| `--task IDX` | 実行するタスク番号 1〜4（複数指定可） | 全タスク |
+| `--seed S` | 乱数のベースシード | `1234` |
+| `--temperature` | 生成温度 | `0.7` |
+| `--top-p` | top-p サンプリング | `0.8` |
+| `--store PATH` | 結果ストアパス | `results.jsonl` |
+| `--report PATH` | HTML レポートパス | `experiment_report.html` |
+| `--report-only` | 生成せずサマリ + HTML のみ再計算 | — |
+| `--reset` | ストア削除 | — |
 
 ## 出力例
 
 ```
-condition   p_raw  p_accept  trim%   E[N]  P(N=2)  P(N=3)    MAE  p_punct  p_nat
---------------------------------------------------------------------------------
-baseline     0.12      0.38    18%   2.63    0.62    0.77   12.3     0.85   0.90
-hard_only    0.55      0.75     8%   1.33    0.94    0.98    4.1     0.92   0.88
-hard_soft    0.72      0.85     5%   1.18    0.98    1.00    2.8     0.95   0.95
-floor_sent   0.60      0.70    12%   1.43    0.91    0.97    5.2     0.98   0.80
+condition          n  p_raw         p_accept        trim%  E[N]  P(N≤2)  P(N≤3)    MAE  p_punct  p_nat
+baseline          32  0.12[0.05,0.25] 0.38[0.22,0.56]   18%  2.63   0.62    0.77   12.3     0.85   0.90
+hard_only         32  0.55[0.38,0.71] 0.75[0.57,0.87]    8%  1.33   0.94    0.98    4.1     0.92   0.88
+hard_soft         32  0.72[0.55,0.85] 0.85[0.69,0.94]    5%  1.18   0.98    1.00    2.8     0.95   0.95
 ```
 
 | 指標 | 意味 |
 |---|---|
-| `p_raw` | トリム前から範囲内に着地した割合（自然収束の度合い） |
-| `p_accept` | 品質チェック込みの最終合格率 |
+| `n` | 累積サンプル数（全タスク合計） |
+| `p_raw` | トリム前から範囲内に着地した割合（Wilson 95%CI 付き） |
+| `p_accept` | 品質チェック込みの最終合格率（Wilson 95%CI 付き） |
 | `trim%` | 上限トリムが発火した割合 |
 | `E[N]` | 期待生成回数 = 1 / p_accept |
-| `P(N=k)` | k 回以内に 1 回合格する確率 |
+| `P(N≤k)` | k 回以内に 1 回合格する確率 |
 | `MAE` | 帯中心からの平均絶対文字数ズレ |
 | `p_punct` | raw テキストが文末記号で終わった割合 |
 | `p_nat` | 自然さ判定で「はい」だった割合（文末記号合格サンプルのみ） |
@@ -96,6 +126,7 @@ floor_sent   0.60      0.70    12%   1.43    0.91    0.97    5.2     0.98   0.80
 
 ```
 run_experiment.py   # メインスクリプト（全処理が含まれる）
+results.jsonl       # 永続累積ストア（サンプル単位 JSONL、自動削除されない）
 ```
 
 ## カスタマイズ
@@ -103,20 +134,10 @@ run_experiment.py   # メインスクリプト（全処理が含まれる）
 `run_experiment.py` の以下を変更することで動作を調整できます。
 
 ```python
-MODEL_ID = "Qwen/Qwen3.5-9B"   # モデル変更
+MODEL_ID = "Qwen/Qwen3.5-9B"   # モデル変更（検証時は "Qwen/Qwen3-1.7B" 推奨）
+BASE_SEED = 1234                 # ベースシード（--seed でも変更可）
 ```
 
-```python
-tasks = [
-    (SAMPLE, 280, 400),   # (テキスト, 下限, 上限) を追加・変更
-    (SAMPLE, 140, 200),
-    (SAMPLE,  70, 100),
-    (SAMPLE,  49,  70),
-]
-```
-
-```python
-summary, records = run_experiment(tasks, K=8)   # K: 1条件あたりのサンプル数
-```
+タスク定義は `TASKS` リスト（`(text, lower, upper)` の組）を変更してください。タスクを追加・変更すると `task_hash` が変わり、旧レコードとは別の実験として蓄積されます。
 
 `CharRangeProcessor` の `soft_frac`（ソフトブーストを開始する帯内の位置比率）や `boost`（ロジット加算量）も調整可能です。

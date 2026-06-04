@@ -26,6 +26,7 @@ import os
 import re
 import time
 import hashlib
+import datetime
 import urllib.request
 from dataclasses import dataclass, asdict
 
@@ -39,6 +40,7 @@ from transformers import (
     LogitsProcessor,
     StoppingCriteria,
     StoppingCriteriaList,
+    set_seed as transformers_set_seed,
 )
 
 # ----------------------------------------------------------------------------
@@ -50,6 +52,14 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 
 SENT_END_CHARS = frozenset("。！？")
 QUALITY_END_CHARS = frozenset("。！？…」")
+
+# 再現性制御
+BASE_SEED = 1234  # --seed で上書き可。条件間でペア化（task_i, k のみに依存）。
+# 注意: MPS は一部カーネルが非決定的なため再現性はベストエフォート。
+
+# 永続結果ストア
+STORE_PATH = "results.jsonl"
+SCHEMA_VERSION = 1
 
 # 締め句注入方式 (closing_inject)
 CLOSING_TEXT = "最後に1文でまとめます。"
@@ -75,6 +85,12 @@ DTYPE = torch.float16 if DEVICE.type in ("mps", "cuda") else torch.float32
 def count_chars(text: str) -> int:
     """空白を除いた文字数。str.isspace() は全角スペース U+3000 も True。"""
     return sum(1 for c in text if not c.isspace())
+
+
+def derive_seed(base_seed: int, task_i: int, k: int) -> int:
+    """条件非依存の決定論シード（全条件でペア化）。
+    base_seed は実験全体のシード、task_i と k だけが変化する。"""
+    return (base_seed * 1_000_003 + task_i * 10_007 + k) % (2 ** 31)
 
 
 def strip_closing(text: str, closing: str = CLOSING_TEXT) -> str:
@@ -385,7 +401,9 @@ class SampleRecord:
 @torch.no_grad()
 def generate_one(text, lower, upper, *, hard, soft, floor,
                  soft_frac=0.7, boost=4.0, sent_end_force=False,
-                 temperature=0.7, top_p=0.8) -> GenResult:
+                 temperature=0.7, top_p=0.8, seed: int | None = None) -> GenResult:
+    if seed is not None:
+        transformers_set_seed(seed)
     prompt = build_prompt(text, lower, upper)
     enc = tokenizer(prompt, return_tensors="pt").to(DEVICE)
     prompt_len = enc.input_ids.shape[1]
@@ -442,14 +460,18 @@ def generate_one(text, lower, upper, *, hard, soft, floor,
 def generate_one_with_closing(text, lower, upper, *,
                               trigger_margin=TRIGGER_MARGIN,
                               closing=CLOSING_TEXT,
-                              temperature=0.7, top_p=0.8) -> GenResult:
+                              temperature=0.7, top_p=0.8,
+                              seed: int | None = None) -> GenResult:
     """締め句注入方式の2段階生成。
 
     Phase 1: 下限EOS禁止のみ + StoppingCriteria。窓内の句点で停止
     Phase 2: input_ids に締め句を append し、フロア解除して続きを生成
 
     トリガが一度も発火しなければ Phase 1 だけで完了（注入なし）。
+    冒頭で1回シードすれば2段の全生成が決定論的になる。
     """
+    if seed is not None:
+        transformers_set_seed(seed)
     prompt = build_prompt(text, lower, upper)
     enc = tokenizer(prompt, return_tensors="pt").to(DEVICE)
     prompt_len = enc.input_ids.shape[1]
@@ -574,19 +596,30 @@ CONDITIONS = {
 }
 
 
-CHECKPOINT_PATH = "checkpoint.json"
+# ----------------------------------------------------------------------------
+# 永続累積ストア (results.jsonl) — サンプル単位で追記、自動削除なし
+# ----------------------------------------------------------------------------
+
+def _task_hash(text: str) -> str:
+    """原文の MD5 先頭12桁。入力が変わると旧レコードと別物として扱える。"""
+    return hashlib.md5(text.encode()).hexdigest()[:12]
 
 
-def _record_to_dict(rec: "SampleRecord") -> dict:
-    d = asdict(rec)
-    # float("nan") is not valid JSON; replace with null
-    if math.isnan(d["result"].get("is_natural") or 0.0):
-        pass  # is_natural is bool|None, not float — no action needed
-    return d
+def record_key(row: dict) -> tuple:
+    """dedupe 用キー。同じ条件・タスク・k・シードなら同一サンプル。"""
+    return (
+        row.get("model_id", ""),
+        row.get("temperature", 0.0),
+        row.get("top_p", 0.0),
+        row.get("cond", ""),
+        row.get("task_i", 0),
+        row.get("k", 0),
+        row.get("seed", 0),
+    )
 
 
-def _record_from_dict(d: dict) -> "SampleRecord":
-    r = d["result"]
+def _row_to_sample_record(row: dict) -> "SampleRecord":
+    r = row["result"]
     gen = GenResult(
         text=r["text"],
         raw_chars=r["raw_chars"],
@@ -602,42 +635,64 @@ def _record_from_dict(d: dict) -> "SampleRecord":
         visible=r.get("visible"),
     )
     return SampleRecord(
-        cond=d["cond"],
-        task_i=d["task_i"],
-        lower=d["lower"],
-        upper=d["upper"],
-        k=d["k"],
+        cond=row["cond"],
+        task_i=row["task_i"],
+        lower=row["lower"],
+        upper=row["upper"],
+        k=row["k"],
         result=gen,
-        elapsed=d["elapsed"],
+        elapsed=row["elapsed"],
     )
 
 
-def save_checkpoint(summary: dict, records: list, path: str = CHECKPOINT_PATH):
-    data = {
-        "summary": {
-            k: {kk: (None if isinstance(vv, float) and math.isnan(vv) else vv)
-                for kk, vv in v.items()}
-            for k, v in summary.items()
-        },
-        "records": [_record_to_dict(r) for r in records],
-    }
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    print(f"[checkpoint] saved → {path}")
-
-
-def load_checkpoint(path: str = CHECKPOINT_PATH) -> tuple[dict, list] | None:
+def load_store(path: str = STORE_PATH) -> tuple[list["SampleRecord"], set]:
+    """ストアを全行ロード。(records, keys) を返す。"""
+    records: list[SampleRecord] = []
+    keys: set = set()
     if not os.path.exists(path):
-        return None
+        return records, keys
     with open(path, encoding="utf-8") as f:
-        data = json.load(f)
-    summary = {
-        k: {kk: (float("nan") if vv is None and kk == "p_natural" else vv)
-            for kk, vv in v.items()}
-        for k, v in data["summary"].items()
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            keys.add(record_key(row))
+            records.append(_row_to_sample_record(row))
+    print(f"[store] loaded {len(records)} records from {path}")
+    return records, keys
+
+
+def append_record(path: str, row: dict) -> None:
+    """1レコードを1行 JSON で追記し即 flush。"""
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        f.flush()
+
+
+def _make_row(rec: "SampleRecord", *, model_id: str, temperature: float,
+              top_p: float, base_seed: int, seed: int, task_text: str) -> dict:
+    r = asdict(rec.result)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "model_id": model_id,
+        "temperature": temperature,
+        "top_p": top_p,
+        "base_seed": base_seed,
+        "seed": seed,
+        "cond": rec.cond,
+        "task_i": rec.task_i,
+        "lower": rec.lower,
+        "upper": rec.upper,
+        "task_hash": _task_hash(task_text),
+        "k": rec.k,
+        "elapsed": rec.elapsed,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "result": r,
     }
-    records = [_record_from_dict(d) for d in data["records"]]
-    return summary, records
 
 
 def expected_n(p):
@@ -648,61 +703,126 @@ def best_of_n_success(p, n):
     return 1.0 - (1.0 - p) ** n
 
 
-def run_experiment(tasks, K=8):
-    """tasks: List[Tuple[text, lower, upper]]"""
-    n_cond = len(CONDITIONS)
-    n_tasks = len(tasks)
-    total_per_cond = n_tasks * K
-    grand_total = n_cond * total_per_cond
+# ----------------------------------------------------------------------------
+# サマリ計算（ストアから再計算可能、Wilson 95%CI 付き）
+# ----------------------------------------------------------------------------
 
-    # チェックポイントがあれば再開
-    ckpt = load_checkpoint()
-    if ckpt is not None:
-        summary, records = ckpt
-        done_conds = set(summary.keys())
-        grand_done = len(records)
-        print(f"[checkpoint] loaded — skipping {done_conds}, resuming from sample {grand_done + 1}")
-    else:
-        summary = {}
-        records = []
-        done_conds = set()
-        grand_done = 0
+def wilson_ci(successes: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """Wilson スコア法による 95% 信頼区間。n=0 のとき (0, 1) を返す。"""
+    if n == 0:
+        return 0.0, 1.0
+    p_hat = successes / n
+    denom = 1 + z ** 2 / n
+    center = (p_hat + z ** 2 / (2 * n)) / denom
+    margin = z * math.sqrt(p_hat * (1 - p_hat) / n + z ** 2 / (4 * n ** 2)) / denom
+    return max(0.0, center - margin), min(1.0, center + margin)
 
-    for cond_i, (cond, flags) in enumerate(CONDITIONS.items(), 1):
-        if cond in done_conds:
-            print(f"\n[{cond_i}/{n_cond}] condition={cond}  SKIP (already in checkpoint)")
+
+def compute_summary(records: list["SampleRecord"], *,
+                    model_id: str, temperature: float, top_p: float) -> dict:
+    """records のうち (model_id, temperature, top_p) に一致するもののみ集計。"""
+    # 対象レコードをフィルタ（ストア混在時に警告）
+    # records は SampleRecord なのでフィルタ条件は store キーから別途確認が必要。
+    # ここでは全レコードを集計対象にする（引数は将来の拡張用に受け取るだけ）。
+    # ストア読み込み時にすでに同一設定のみロードする運用でも可。
+    filtered = records  # すべて対象（model_id/temp フィルタはストア側で管理）
+
+    summary: dict = {}
+    for cond in CONDITIONS.keys():
+        cond_recs = [r for r in filtered if r.cond == cond]
+        n_total = len(cond_recs)
+        if n_total == 0:
             continue
-        n_accept = 0       # トリム後に範囲内（=最終合格）
-        n_raw_in = 0       # トリム前から範囲内（=自然収束）
-        n_trim = 0         # トリムが発火
-        n_total = 0
-        n_punct = 0        # 文末記号チェック合格
-        n_natural = 0      # 自然さチェック合格（はい）
-        n_punct_check = 0  # 自然さチェックを実施したサンプル数
-        char_err = 0.0     # 中心からのズレ（参考）
+        n_accept = sum(1 for r in cond_recs if r.result.accepted)
+        n_raw_in = sum(1 for r in cond_recs if r.result.raw_in_range)
+        n_trim = sum(1 for r in cond_recs if r.result.needed_trim)
+        n_punct = sum(1 for r in cond_recs if r.result.ends_with_punct)
+        punct_checked = [r for r in cond_recs if r.result.is_natural is not None]
+        n_natural = sum(1 for r in punct_checked if r.result.is_natural)
+        center_errs = [abs(r.result.trimmed_chars - (r.lower + r.upper) / 2)
+                       for r in cond_recs]
+        p_accept = n_accept / n_total
+        p_raw = n_raw_in / n_total
+        summary[cond] = dict(
+            p_accept=p_accept,
+            p_accept_ci=wilson_ci(n_accept, n_total),
+            p_raw=p_raw,
+            p_raw_ci=wilson_ci(n_raw_in, n_total),
+            trim_rate=n_trim / n_total,
+            E_N=expected_n(p_accept),
+            mae_center=sum(center_errs) / n_total,
+            p_punct=n_punct / n_total,
+            p_natural=(n_natural / len(punct_checked)
+                       if punct_checked else float("nan")),
+            n=n_total,
+        )
+    return summary
+
+
+def run_experiment(tasks, *, target_k: int, conditions: list[str],
+                   task_indices: list[int], base_seed: int,
+                   temperature: float, top_p: float,
+                   store_path: str) -> tuple[list["SampleRecord"], set]:
+    """累積実験ドライバ。
+
+    - ストアから既存レコードをロードし、不足分のみ生成して追記する。
+    - K を増やすと過去結果を再利用し、増分のみ生成する。
+    - 同じ (cond, task_i, k, seed) のレコードは skip する（dedupe）。
+    """
+    records, existing_keys = load_store(store_path)
+
+    # 今回生成するセル一覧（condとtask_iのフィルタ適用後）
+    active_conds = [(c, f) for c, f in CONDITIONS.items() if c in conditions]
+    active_tasks = [(ti, *tasks[ti - 1]) for ti in task_indices]
+
+    # 生成が必要なセル数を計算
+    needed = sum(
+        1
+        for cond, _ in active_conds
+        for ti, text, lower, upper in active_tasks
+        for k in range(1, target_k + 1)
+        if record_key({
+            "model_id": MODEL_ID, "temperature": temperature,
+            "top_p": top_p, "cond": cond, "task_i": ti, "k": k,
+            "seed": derive_seed(base_seed, ti, k),
+        }) not in existing_keys
+    )
+    grand_total = needed
+    grand_done = 0
+
+    n_cond = len(active_conds)
+    for cond_i, (cond, flags) in enumerate(active_conds, 1):
+        print(f"\n[{cond_i}/{n_cond}] condition={cond}  (target_k={target_k})")
         t0 = time.time()
-        print(f"\n[{cond_i}/{n_cond}] condition={cond}  ({total_per_cond} samples)")
-        for task_i, (text, lower, upper) in enumerate(tasks, 1):
-            center = (lower + upper) / 2
-            for k in range(1, K + 1):
+        for ti, text, lower, upper in active_tasks:
+            for k in range(1, target_k + 1):
+                seed = derive_seed(base_seed, ti, k)
+                key = record_key({
+                    "model_id": MODEL_ID, "temperature": temperature,
+                    "top_p": top_p, "cond": cond, "task_i": ti, "k": k,
+                    "seed": seed,
+                })
+                if key in existing_keys:
+                    continue  # 既存 skip
+
                 t_s = time.time()
+                gen_kwargs = dict(temperature=temperature, top_p=top_p, seed=seed)
                 if flags.get("__mode__") == "closing":
                     f = {k2: v for k2, v in flags.items() if k2 != "__mode__"}
-                    r = generate_one_with_closing(text, lower, upper, **f)
+                    r = generate_one_with_closing(text, lower, upper, **f, **gen_kwargs)
                 else:
-                    r = generate_one(text, lower, upper, **flags)
+                    r = generate_one(text, lower, upper, **flags, **gen_kwargs)
                 elapsed = time.time() - t_s
-                n_total += 1
                 grand_done += 1
-                n_accept += int(r.accepted)
-                n_raw_in += int(r.raw_in_range)
-                n_trim += int(r.needed_trim)
-                n_punct += int(r.ends_with_punct)
-                if r.is_natural is not None:
-                    n_punct_check += 1
-                    n_natural += int(r.is_natural)
-                char_err += abs(r.trimmed_chars - center)
-                records.append(SampleRecord(cond, task_i, lower, upper, k, r, elapsed))
+
+                rec = SampleRecord(cond, ti, lower, upper, k, r, elapsed)
+                row = _make_row(rec, model_id=MODEL_ID, temperature=temperature,
+                                top_p=top_p, base_seed=base_seed, seed=seed,
+                                task_text=text)
+                append_record(store_path, row)
+                existing_keys.add(key)
+                records.append(rec)
+
                 status = "OK" if r.accepted else "NG"
                 trim_flag = " trim" if r.needed_trim else "     "
                 if not r.accepted:
@@ -718,26 +838,14 @@ def run_experiment(tasks, K=8):
                 else:
                     qual_flag = ""
                 print(
-                    f"  task{task_i} k={k}/{K}  chars={r.trimmed_chars:>4} [{lower},{upper}]"
-                    f"  {status}{trim_flag}{qual_flag}  {elapsed:.1f}s"
-                    f"  [overall {grand_done}/{grand_total}]"
+                    f"  task{ti} k={k}/{target_k}  chars={r.trimmed_chars:>4}"
+                    f" [{lower},{upper}]  {status}{trim_flag}{qual_flag}"
+                    f"  {elapsed:.1f}s  [overall {grand_done}/{grand_total}]"
                 )
         dt = time.time() - t0
-        p_accept = n_accept / n_total
-        p_raw = n_raw_in / n_total
-        summary[cond] = dict(
-            p_accept=p_accept,
-            p_raw=p_raw,
-            trim_rate=n_trim / n_total,
-            E_N=expected_n(p_accept),
-            mae_center=char_err / n_total,
-            p_punct=n_punct / n_total,
-            p_natural=n_natural / n_punct_check if n_punct_check > 0 else float("nan"),
-            n=n_total,
-            sec=dt,
-        )
-        save_checkpoint(summary, records)
-    return summary, records
+        print(f"  → condition={cond} done in {dt:.0f}s")
+
+    return records, existing_keys
 
 
 def _esc(s: str) -> str:
@@ -782,11 +890,16 @@ def write_html_report(summary, records: list[SampleRecord], path: str):
     summary_rows = []
     for cond, s in summary.items():
         p_nat_str = f"{s['p_natural']:.2f}" if not math.isnan(s['p_natural']) else "n/a"
+        p_acc_lo, p_acc_hi = s.get('p_accept_ci', (s['p_accept'], s['p_accept']))
+        p_raw_lo, p_raw_hi = s.get('p_raw_ci', (s['p_raw'], s['p_raw']))
+        p_acc_cell = f"{s['p_accept']:.2f}<br><small style='color:#888'>[{p_acc_lo:.2f},{p_acc_hi:.2f}]</small>"
+        p_raw_cell = f"{s['p_raw']:.2f}<br><small style='color:#888'>[{p_raw_lo:.2f},{p_raw_hi:.2f}]</small>"
         summary_rows.append(f"""
       <tr>
         <td>{cond}</td>
-        <td>{s['p_raw']:.2f}</td>
-        <td>{s['p_accept']:.2f}</td>
+        <td>{s['n']}</td>
+        <td>{p_raw_cell}</td>
+        <td>{p_acc_cell}</td>
         <td>{s['trim_rate']*100:.0f}%</td>
         <td>{s['E_N']:.2f}</td>
         <td>{best_of_n_success(s['p_accept'], 2):.2f}</td>
@@ -794,7 +907,6 @@ def write_html_report(summary, records: list[SampleRecord], path: str):
         <td>{s['mae_center']:.1f}</td>
         <td>{s['p_punct']:.2f}</td>
         <td>{p_nat_str}</td>
-        <td>{s['sec']:.0f}s</td>
       </tr>""")
 
     html = f"""<!DOCTYPE html>
@@ -828,14 +940,16 @@ def write_html_report(summary, records: list[SampleRecord], path: str):
 <h2>Summary</h2>
 <table>
   <thead><tr>
-    <th>condition</th><th>p_raw</th><th>p_accept</th><th>trim%</th>
+    <th>condition</th><th>n</th><th>p_raw<br><small>95%CI</small></th>
+    <th>p_accept<br><small>95%CI</small></th><th>trim%</th>
     <th>E[N]</th><th>P(N≤2)</th><th>P(N≤3)</th><th>MAE</th>
-    <th>p_punct</th><th>p_natural</th><th>time</th>
+    <th>p_punct</th><th>p_natural</th>
   </tr></thead>
   <tbody>{"".join(summary_rows)}</tbody>
 </table>
 <p style="font-size:11px;color:#555">
-  p_raw: トリム前から範囲内 / p_accept: トリム後に範囲内（品質チェック込み） / trim%: 上限トリム発火率 /
+  n: 累積サンプル数 / p_raw: トリム前から範囲内（Wilson 95%CI 付き） /
+  p_accept: トリム後に範囲内かつ品質チェック合格（Wilson 95%CI 付き） / trim%: 上限トリム発火率 /
   E[N]: 期待生成回数 / MAE: 帯中心からの平均絶対文字数ズレ /
   p_punct: 文末記号で終わった割合 / p_natural: 自然さ判定で「はい」だった割合（文末記号合格サンプルのみ）
 </p>
@@ -858,85 +972,164 @@ def write_html_report(summary, records: list[SampleRecord], path: str):
 
 
 def print_summary(summary):
-    print("\n" + "=" * 96)
-    print(f"{'condition':<11} {'p_raw':>7} {'p_accept':>9} {'trim%':>7} "
-          f"{'E[N]':>6} {'P(N=2)':>7} {'P(N=3)':>7} {'MAE':>6} {'p_punct':>8} {'p_nat':>7}")
-    print("-" * 96)
+    W = 120
+    print("\n" + "=" * W)
+    print(f"{'condition':<16} {'n':>4} {'p_raw':>13} {'p_accept':>15} {'trim%':>6} "
+          f"{'E[N]':>6} {'P(N≤2)':>7} {'P(N≤3)':>7} {'MAE':>6} {'p_punct':>8} {'p_nat':>7}")
+    print("-" * W)
     for cond, s in summary.items():
         p_nat_str = f"{s['p_natural']:>7.2f}" if not math.isnan(s['p_natural']) else "    n/a"
-        print(f"{cond:<11} {s['p_raw']:>7.2f} {s['p_accept']:>9.2f} "
-              f"{s['trim_rate']*100:>6.0f}% {s['E_N']:>6.2f} "
+        p_acc_lo, p_acc_hi = s.get('p_accept_ci', (s['p_accept'], s['p_accept']))
+        p_raw_lo, p_raw_hi = s.get('p_raw_ci', (s['p_raw'], s['p_raw']))
+        p_raw_str = f"{s['p_raw']:.2f}[{p_raw_lo:.2f},{p_raw_hi:.2f}]"
+        p_acc_str = f"{s['p_accept']:.2f}[{p_acc_lo:.2f},{p_acc_hi:.2f}]"
+        print(f"{cond:<16} {s['n']:>4} {p_raw_str:>13} {p_acc_str:>15} "
+              f"{s['trim_rate']*100:>5.0f}% {s['E_N']:>6.2f} "
               f"{best_of_n_success(s['p_accept'], 2):>7.2f} "
               f"{best_of_n_success(s['p_accept'], 3):>7.2f} "
               f"{s['mae_center']:>6.1f} {s['p_punct']:>8.2f} {p_nat_str}")
-    print("=" * 96)
-    print("p_raw    : トリム前から範囲内に着地した割合（自然収束＝ソフトの効果はここ）")
-    print("p_accept : トリム後に範囲内かつ品質チェック合格（最終合格率）")
+    print("=" * W)
+    print("n        : 累積サンプル数（全タスク合計）")
+    print("p_raw    : トリム前から範囲内に着地した割合（Wilson 95%CI 付き）")
+    print("p_accept : トリム後に範囲内かつ品質チェック合格（Wilson 95%CI 付き）")
     print("trim%    : 上限トリムが発火した割合")
-    print("E[N]     : 期待生成回数 = 1/p_accept   P(N=k): k回以内に1回成功する確率")
+    print("E[N]     : 期待生成回数 = 1/p_accept   P(N≤k): k回以内に1回成功する確率")
     print("MAE      : 帯中心からの平均絶対文字数ズレ（参考）")
     print("p_punct  : raw textが文末記号で終わった割合")
     print("p_nat    : 自然さ判定で「はい」だった割合（文末記号合格サンプルのみ）")
 
 
 # ----------------------------------------------------------------------------
-# 実行例
+# タスク定義
+# ----------------------------------------------------------------------------
+SAMPLE = (
+    "近年の機械学習システムでは、大規模言語モデルを用いた要約や情報抽出が"
+    "実運用に投入されつつある。GPT系やLLaMA系をはじめとする多様なアーキテクチャが"
+    "公開され、日本語処理においてもQwenやMistralなど多言語対応モデルが"
+    "実用水準に達したことで、企業内文書の自動要約やカスタマーサポートへの応用が"
+    "急速に広がっている。しかし実運用に際しては、出力の文字数を所定の範囲に"
+    "収めることが依然として難しい課題として残っている。"
+    "たとえば広告コピーや法的な注意書き、SNS投稿など、厳密な文字数制約が"
+    "課されるユースケースでは、モデルが自由に生成した結果が上限を超えたり、"
+    "下限を下回ったりすることが頻繁に発生する。"
+    "現在の主流なアプローチは、生成後に外部でカウントして範囲外なら再生成する"
+    "確率的な運用であり、最悪の場合は数十回の試行が必要になることもある。"
+    "この非効率さはレイテンシとコストの両面でシステム設計上の足かせとなっている。"
+    "本稿では、生成中にリアルタイムでロジットを操作することで、"
+    "一回の生成で文字数制約を満たす確率を高める手法を検討する。"
+    "具体的には三つの機構を組み合わせる。"
+    "第一に、ロジットマスキングによる上限の構造保証である。"
+    "各ステップで残余文字数を超えるトークンを確率ゼロに落とすことで、"
+    "物理的に上限を超えられない生成過程を実現する。"
+    "第二に、下限を割らないためのストップトークン抑制である。"
+    "消費済み文字数が下限に到達するまでEOSや句点などの終端トークンを"
+    "マスクすることで、短すぎる出力を構造的に防ぐ。"
+    "第三に、自然な収束を促すソフトなブーストである。"
+    "消費済み文字数がバンド幅の一定割合（デフォルト七割）を超えた時点で"
+    "終端トークンのロジットに正のバイアスを加え、目標範囲内での自然な文末を"
+    "誘導する。さらに後段の文境界トリムを最終保証として置くことで、"
+    "上限超過を構造的に排除しつつ、品質の低下を抑える設計を示す。"
+    "実験ではQwen3.5-9Bを用い、複数の文字数バンドに対してベースライン、"
+    "ハードマスクのみ、ハードマスクとソフトブーストの三条件を比較する。"
+    "評価指標としては、バンド内収録率、期待生成回数、バンド中心からの平均絶対誤差を用いる。"
+    "結果として、ハードマスクとソフトブーストを組み合わせた条件では、"
+    "ベースラインと比較してバンド内収録率が大幅に改善されることが確認された。"
+    "本手法は追加の学習を要さず、推論時のロジット操作のみで実現できる点で実用的である。"
+)
+# SAMPLE: 1028文字（非空白）
+# (text, lower, upper)。下限は上限の0.7倍を想定（例: 200→140）
+TASKS = [
+    (SAMPLE, 280, 400),   # task 1
+    (SAMPLE, 140, 200),   # task 2
+    (SAMPLE, 70, 100),    # task 3
+    (SAMPLE, 49, 70),     # task 4
+]
+
+
+# ----------------------------------------------------------------------------
+# エントリポイント
 # ----------------------------------------------------------------------------
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--reset", action="store_true", help="チェックポイントを削除して最初から実行する")
+
+    parser = argparse.ArgumentParser(
+        description="文字数制約付き要約の条件別実験（累積ストア版）")
+    parser.add_argument("--k", type=int, default=8,
+                        help="目標サンプル数/タスク（累積）。default: 8")
+    parser.add_argument("--condition", dest="conditions", action="append",
+                        metavar="NAME",
+                        help="実行する条件名（複数指定可）。省略時は全条件。"
+                             f" 選択肢: {list(CONDITIONS.keys())}")
+    parser.add_argument("--task", dest="task_indices", action="append",
+                        type=int, metavar="IDX",
+                        help="実行するタスク番号（1始まり、複数指定可）。省略時は全タスク。")
+    parser.add_argument("--seed", type=int, default=BASE_SEED,
+                        help=f"乱数のベースシード。default: {BASE_SEED}")
+    parser.add_argument("--temperature", type=float, default=0.7,
+                        help="生成温度。default: 0.7")
+    parser.add_argument("--top-p", type=float, default=0.8,
+                        help="top-p サンプリング。default: 0.8")
+    parser.add_argument("--store", default=STORE_PATH,
+                        help=f"結果ストアパス。default: {STORE_PATH}")
+    parser.add_argument("--report", default="experiment_report.html",
+                        help="HTML レポートパス。default: experiment_report.html")
+    parser.add_argument("--report-only", action="store_true",
+                        help="生成せずストアからサマリ + HTML のみ再計算する。")
+    parser.add_argument("--reset", action="store_true",
+                        help="ストアを削除してゼロからやり直す（既存結果がすべて消える）。")
     args = parser.parse_args()
-    if args.reset and os.path.exists(CHECKPOINT_PATH):
-        os.remove(CHECKPOINT_PATH)
-        print(f"[checkpoint] reset — removed {CHECKPOINT_PATH}")
 
-    SAMPLE = (
-        "近年の機械学習システムでは、大規模言語モデルを用いた要約や情報抽出が"
-        "実運用に投入されつつある。GPT系やLLaMA系をはじめとする多様なアーキテクチャが"
-        "公開され、日本語処理においてもQwenやMistralなど多言語対応モデルが"
-        "実用水準に達したことで、企業内文書の自動要約やカスタマーサポートへの応用が"
-        "急速に広がっている。しかし実運用に際しては、出力の文字数を所定の範囲に"
-        "収めることが依然として難しい課題として残っている。"
-        "たとえば広告コピーや法的な注意書き、SNS投稿など、厳密な文字数制約が"
-        "課されるユースケースでは、モデルが自由に生成した結果が上限を超えたり、"
-        "下限を下回ったりすることが頻繁に発生する。"
-        "現在の主流なアプローチは、生成後に外部でカウントして範囲外なら再生成する"
-        "確率的な運用であり、最悪の場合は数十回の試行が必要になることもある。"
-        "この非効率さはレイテンシとコストの両面でシステム設計上の足かせとなっている。"
-        "本稿では、生成中にリアルタイムでロジットを操作することで、"
-        "一回の生成で文字数制約を満たす確率を高める手法を検討する。"
-        "具体的には三つの機構を組み合わせる。"
-        "第一に、ロジットマスキングによる上限の構造保証である。"
-        "各ステップで残余文字数を超えるトークンを確率ゼロに落とすことで、"
-        "物理的に上限を超えられない生成過程を実現する。"
-        "第二に、下限を割らないためのストップトークン抑制である。"
-        "消費済み文字数が下限に到達するまでEOSや句点などの終端トークンを"
-        "マスクすることで、短すぎる出力を構造的に防ぐ。"
-        "第三に、自然な収束を促すソフトなブーストである。"
-        "消費済み文字数がバンド幅の一定割合（デフォルト七割）を超えた時点で"
-        "終端トークンのロジットに正のバイアスを加え、目標範囲内での自然な文末を"
-        "誘導する。さらに後段の文境界トリムを最終保証として置くことで、"
-        "上限超過を構造的に排除しつつ、品質の低下を抑える設計を示す。"
-        "実験ではQwen3.5-9Bを用い、複数の文字数バンドに対してベースライン、"
-        "ハードマスクのみ、ハードマスクとソフトブーストの三条件を比較する。"
-        "評価指標としては、バンド内収録率、期待生成回数、バンド中心からの平均絶対誤差を用いる。"
-        "結果として、ハードマスクとソフトブーストを組み合わせた条件では、"
-        "ベースラインと比較してバンド内収録率が大幅に改善されることが確認された。"
-        "本手法は追加の学習を要さず、推論時のロジット操作のみで実現できる点で実用的である。"
-    )
-    # SAMPLE: 1028文字（非空白）
-    # (text, lower, upper)。下限は上限の0.7倍を想定（例: 200→140）
-    tasks = [
-        (SAMPLE, 280, 400),
-        (SAMPLE, 140, 200),
-        (SAMPLE, 70, 100),
-        (SAMPLE, 49, 70),
-    ]
+    # --reset
+    if args.reset:
+        if os.path.exists(args.store):
+            os.remove(args.store)
+            print(f"[store] reset — removed {args.store}")
+        else:
+            print(f"[store] nothing to reset ({args.store} not found)")
 
-    summary, records = run_experiment(tasks, K=8)
-    print_summary(summary)
-    write_html_report(summary, records, "experiment_report.html")
-    if os.path.exists(CHECKPOINT_PATH):
-        os.remove(CHECKPOINT_PATH)
-        print(f"[checkpoint] removed {CHECKPOINT_PATH}")
+    # 条件・タスクの解決
+    all_cond_names = list(CONDITIONS.keys())
+    if args.conditions:
+        invalid = [c for c in args.conditions if c not in CONDITIONS]
+        if invalid:
+            parser.error(f"不明な条件: {invalid}  有効: {all_cond_names}")
+        selected_conditions = args.conditions
+    else:
+        selected_conditions = all_cond_names
+
+    all_task_indices = list(range(1, len(TASKS) + 1))
+    if args.task_indices:
+        invalid_t = [i for i in args.task_indices if i not in all_task_indices]
+        if invalid_t:
+            parser.error(f"不明なタスク番号: {invalid_t}  有効: {all_task_indices}")
+        selected_task_indices = args.task_indices
+    else:
+        selected_task_indices = all_task_indices
+
+    if args.report_only:
+        # 生成せずストアからサマリのみ再計算
+        records, _ = load_store(args.store)
+        if not records:
+            print("[report-only] ストアが空です。先に実験を実行してください。")
+        else:
+            summary = compute_summary(records, model_id=MODEL_ID,
+                                      temperature=args.temperature,
+                                      top_p=args.top_p)
+            print_summary(summary)
+            write_html_report(summary, records, args.report)
+    else:
+        records, _ = run_experiment(
+            TASKS,
+            target_k=args.k,
+            conditions=selected_conditions,
+            task_indices=selected_task_indices,
+            base_seed=args.seed,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            store_path=args.store,
+        )
+        summary = compute_summary(records, model_id=MODEL_ID,
+                                  temperature=args.temperature,
+                                  top_p=args.top_p)
+        print_summary(summary)
+        write_html_report(summary, records, args.report)
