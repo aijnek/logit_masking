@@ -52,7 +52,7 @@ SENT_END_CHARS = frozenset("。！？")
 QUALITY_END_CHARS = frozenset("。！？…」")
 
 # 締め句注入方式 (closing_inject)
-CLOSING_TEXT = "最後に、"
+CLOSING_TEXT = "最後に1文でまとめます。"
 CLOSING_TEXT_SHORT = "1文でまとめます。"  # lower < TRIGGER_MARGIN の短バンド用
 TRIGGER_MARGIN = 55  # 下限から何文字手前で注入トリガ窓を開けるか（平均1文≈52字分を確保）
 
@@ -81,7 +81,7 @@ def strip_closing(text: str, closing: str = CLOSING_TEXT) -> str:
     """注入した締め句を可視テキストから除去。
 
     位置を「句点直後」または「文頭」に限定し、モデルが本文中に書いた
-    "最後に〜" を巻き込まないようにする。
+    締め句と同一文字列を巻き込まないようにする。
     """
     text = text.replace("。" + closing, "。")
     if text.startswith(closing):
