@@ -24,6 +24,7 @@ LLM に「〇〇〜△△文字で要約して」とプロンプトだけで指�
 | `hard_only` | 上限ハードマスク ＋ 下限ストップ禁止 |
 | `hard_soft` | `hard_only` ＋ ソフト EOS ブースト |
 | `floor_sent` | 下限ストップ禁止 ＋ 文末強制 EOS ＋ ソフトブースト（ハードマスクなし） |
+| `closing_inject` | 下限手前の窓内で一時停止し締め句を注入後に続きを生成（ハードマスクなし、短バンドは冒頭注入） |
 
 ### 合格判定
 
@@ -60,6 +61,9 @@ uv sync
 
 ```bash
 uv run python run_experiment.py
+
+# チェックポイントを削除して最初から実行する場合
+uv run python run_experiment.py --reset
 ```
 
 初回実行時にモデルのダウンロードとトークン別文字数テーブルの構築が走ります。テーブルは `~/.cache/char_budget/` にキャッシュされ、2回目以降はスキップされます。
@@ -104,8 +108,10 @@ MODEL_ID = "Qwen/Qwen3.5-9B"   # モデル変更
 
 ```python
 tasks = [
-    (SAMPLE, 140, 200),   # (テキスト, 下限, 上限) を追加・変更
+    (SAMPLE, 280, 400),   # (テキスト, 下限, 上限) を追加・変更
+    (SAMPLE, 140, 200),
     (SAMPLE,  70, 100),
+    (SAMPLE,  49,  70),
 ]
 ```
 
