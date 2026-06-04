@@ -31,7 +31,7 @@ LLM に「〇〇〜△△文字で要約して」とプロンプトだけで指�
 
 1. `trim_to_range` によるトリム後に `[lower, upper]` 範囲内に収まること
 2. raw テキストが文末記号（`。！？…」`）で終わっていること
-3. Qwen3.5-9B 自身が「自然な終わり方」と判定すること（`はい` / `いいえ` で判定、曖昧回答はレポートにフラグ表示）
+3. `gpt-oss:20b`（Ollama）が「自然な終わり方」と判定すること（`はい` / `いいえ` で判定、曖昧回答はレポートにフラグ表示）
 
 ## 文字数の定義
 
@@ -42,6 +42,7 @@ LLM に「〇〇〜△△文字で要約して」とプロンプトだけで指�
 - Python 3.11+
 - Apple Silicon Mac (MPS) / NVIDIA GPU (CUDA) / CPU いずれも動作
 - Qwen3.5-9B fp16 は約 18 GB の unified memory が必要。メモリが足りない場合は `MODEL_ID` を `"Qwen/Qwen3-1.7B"` 等に変更してください。
+- 自然さ判定に [Ollama](https://ollama.com) + `gpt-oss:20b` を使用します。事前に `ollama pull gpt-oss:20b` でモデルを取得し、Ollama サーバーを起動しておいてください。
 
 ## セットアップ
 
