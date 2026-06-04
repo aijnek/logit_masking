@@ -27,7 +27,6 @@ import re
 import time
 import hashlib
 import datetime
-import urllib.request
 from dataclasses import dataclass, asdict
 
 from dotenv import load_dotenv
@@ -316,12 +315,9 @@ print(f"[closing_short] text={CLOSING_TEXT_SHORT!r} ids={_closing_short_ids} dec
       f" {'OK' if _closing_short_decoded == CLOSING_TEXT_SHORT else 'MISMATCH!'}")
 
 
-JUDGE_MODEL = "gpt-oss:20b"
-OLLAMA_URL = "http://localhost:11434/api/chat"
-
-
+@torch.no_grad()
 def is_natural_ending(text: str) -> tuple[bool, str]:
-    """文末が自然に終わっているか gpt-oss:20b (Ollama) に判定させる。
+    """文末が自然に終わっているかQwen3.5-9B自身に判定させる。
     戻り値: (判定結果, モデルの生の出力)
     - True: 自然な終わり
     - False: 不自然（途中切れ等）
@@ -338,18 +334,19 @@ def is_natural_ending(text: str) -> tuple[bool, str]:
             "回答（はい／いいえ）:"
         )},
     ]
-    payload = json.dumps({
-        "model": JUDGE_MODEL,
-        "messages": messages,
-        "stream": False,
-        "think": False,
-        "options": {"num_predict": 512, "temperature": 0},
-    }).encode()
-    req = urllib.request.Request(OLLAMA_URL, data=payload, method="POST",
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        body = json.loads(resp.read())
-    answer = body["message"]["content"].strip()
+    prompt_str = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    enc = tokenizer(prompt_str, return_tensors="pt").to(DEVICE)
+    out = model.generate(
+        **enc,
+        max_new_tokens=8,
+        do_sample=False,
+        pad_token_id=tokenizer.eos_token_id,
+    )
+    gen_ids = out[0, enc.input_ids.shape[1]:]
+    answer = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
     if "いいえ" in answer:
         return False, answer
     if "はい" in answer:
