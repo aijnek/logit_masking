@@ -223,20 +223,22 @@ class CharRangeProcessor(LogitsProcessor):
 # 締め句注入用 LogitsProcessor / StoppingCriteria
 # ----------------------------------------------------------------------------
 class ClosingInjectProcessor(LogitsProcessor):
-    """締め句注入方式専用。下限EOS禁止のみを担当（上限介入なし）。
+    """締め句注入方式専用。下限EOS禁止 + オプションで文末EOS強制を担当（上限介入なし）。
 
     used は decode 後に strip_closing で締め句を剥がした「可視文字数」で数える。
     注入済み (injected=True) になったら EOS 禁止を解除する。
+    use_sent_end_force=True の場合: 可視文字数が lower 以上で文末句点になったら EOS を強制。
     """
 
     def __init__(self, lower, upper, prompt_len, tokenizer, stop_ids,
-                 closing_text=CLOSING_TEXT):
+                 closing_text=CLOSING_TEXT, use_sent_end_force=False):
         self.lower = lower
         self.upper = upper
         self.prompt_len = prompt_len
         self.tok = tokenizer
         self.stop_ids = list(stop_ids)
         self.closing_text = closing_text
+        self.use_sent_end_force = use_sent_end_force
         self.injected = False
 
     def set_injected(self, flag: bool):
@@ -252,6 +254,9 @@ class ClosingInjectProcessor(LogitsProcessor):
             if not self.injected and used < self.lower:
                 for sid in self.stop_ids:
                     scores[b, sid] = float("-inf")
+            elif self.use_sent_end_force and vis and vis[-1] in SENT_END_CHARS:
+                for sid in self.stop_ids:
+                    scores[b, sid] = 1e9
 
             if scores[b].max() == float("-inf"):
                 for sid in self.stop_ids:
@@ -483,6 +488,7 @@ def generate_one(text, lower, upper, *, hard, soft, floor,
 def generate_one_with_closing(text, lower, upper, *,
                               trigger_margin=TRIGGER_MARGIN,
                               closing=CLOSING_TEXT,
+                              sent_end_force=False,
                               use_trim=False,
                               temperature=0.7, top_p=0.8,
                               seed: int | None = None) -> GenResult:
@@ -506,6 +512,7 @@ def generate_one_with_closing(text, lower, upper, *,
         closing = CLOSING_TEXT_SHORT
     proc = ClosingInjectProcessor(
         lower, upper, prompt_len, tokenizer, STOP_IDS, closing_text=closing,
+        use_sent_end_force=sent_end_force,
     )
 
     if lower < trigger_margin:
@@ -594,7 +601,9 @@ GEN_FLAGS = {
     "hard_soft":      dict(mode="plain",   hard=False, soft=True,  floor=True),
     "hard_force":     dict(mode="plain",   hard=False, soft=True,  floor=True,
                            soft_frac=0.0, boost=1.5, sent_end_force=True),
-    "closing_inject": dict(mode="closing", trigger_margin=TRIGGER_MARGIN, closing=CLOSING_TEXT),
+    "closing_inject":       dict(mode="closing", trigger_margin=TRIGGER_MARGIN, closing=CLOSING_TEXT),
+    "closing_inject_force": dict(mode="closing", trigger_margin=TRIGGER_MARGIN, closing=CLOSING_TEXT,
+                                 sent_end_force=True),
 }
 
 # 実験条件（8条件）。
@@ -608,8 +617,9 @@ CONDITIONS = {
     "hard_soft":           dict(gen="hard_soft",      trim=False),
     "hard_soft_trim":      dict(derived="hard_soft",  trim=True),
     "hard_force":          dict(gen="hard_force",     trim=False),  # 文末強制 EOS で trim は理論上 N/A
-    "closing_inject":      dict(gen="closing_inject", trim=False),
-    "closing_inject_trim": dict(derived="closing_inject", trim=True),
+    "closing_inject":       dict(gen="closing_inject",       trim=False),
+    "closing_inject_trim":  dict(derived="closing_inject",   trim=True),
+    "closing_inject_force": dict(gen="closing_inject_force", trim=False),
 }
 
 
@@ -858,7 +868,7 @@ def run_experiment(tasks, *, target_k: int, conditions: list[str],
                         print(f"  WARNING: base ({base_cond}, task{ti}, k={k}) が未生成 — skip")
                         continue
                     # closing 系は可視テキスト（締め句除去後）を評価テキストとして使う
-                    if CONDITIONS[base_cond].get("gen") == "closing_inject":
+                    if CONDITIONS[base_cond].get("gen", "").startswith("closing_inject"):
                         eval_text = base_rec.result.visible or base_rec.result.text
                     else:
                         eval_text = base_rec.result.text
