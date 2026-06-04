@@ -363,7 +363,7 @@ def build_prompt(text: str, lower: int, upper: int) -> str:
         {"role": "user", "content":
             f"次の文章を{lower}〜{upper}文字（空白を除く）で要約してください。"
             f"結論を先に書き、指定文字数に収めてください。"
-            f"出力には文字数（例：「（50文字）」など）を含めないでください。\n\n{text}"},
+            f"要約後の文章のみを出力してください。文字数表示は不要です。\n\n{text}"},
     ]
     return tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True,
