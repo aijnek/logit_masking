@@ -550,7 +550,7 @@ def generate_one_with_closing(text, lower, upper, *,
                 closing, add_special_tokens=False, return_tensors="pt",
             ).input_ids.to(DEVICE)
             new_input = torch.cat([out1, closing_ids], dim=1)
-            proc.set_injected(True)
+            # set_injected しない: Phase 2 でも下限 EOS 禁止を維持して lower を保証
             attention_mask = torch.ones_like(new_input)
             # 残予算ベース（vis ベースで残り文字数を測り、安全に余裕を持たせる）
             vis_so_far = strip_closing(
