@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-`run_experiment.py` is a single-file experiment comparing four logit-masking strategies for constraining Japanese summarization output to a character-count range [L, U]. It runs Qwen3.5-9B on MPS/CUDA/CPU and reports acceptance rates, expected generation counts, and MAE from the band center.
+`run_experiment.py` is a single-file experiment comparing eight conditions for constraining Japanese summarization output to a character-count range [L, U] (lower = upper × 0.8). It runs Qwen3.5-9B on MPS/CUDA/CPU and reports acceptance rates, expected generation counts, and MAE from the band center.
 
 ## Commands
 
@@ -53,17 +53,27 @@ Everything lives in `run_experiment.py`. The key components:
 
 **`is_natural_ending(text)`** — Calls `gpt-oss:20b` (Ollama) to judge whether the ending is natural. Returns `(bool, raw_answer_str)`. Ambiguous responses (neither `はい` nor `いいえ`) are treated as passing but flagged in the terminal output and HTML report (shown in orange) for human review.
 
-**Five conditions** defined in `CONDITIONS`:
-- `baseline`: no intervention
-- `hard_only`: hard mask + lower floor, no soft boost
-- `hard_soft`: hard mask + lower floor + soft boost
-- `floor_sent`: lower floor + soft boost from 0% of band + sentence-end EOS force (no hard mask)
-- `closing_inject`: lower floor only + closing phrase injection near the lower boundary
+**Eight conditions** — lower bound always uses hard EOS floor; upper bound control varies. `GEN_FLAGS` holds generation parameters; `CONDITIONS` maps condition names to `gen` (base) or `derived` (re-uses base output) plus `trim` flag.
+
+| # | Condition | Upper control | trim |
+|---|-----------|--------------|------|
+| 1 | `baseline` | none | N/A |
+| 2 | `baseline_trim` | none (reuses #1) | ✓ |
+| 3 | `hard_hard` | hard mask | N/A |
+| 4 | `hard_soft` | soft boost (no hard mask) | — |
+| 5 | `hard_soft_trim` | soft boost (reuses #4) | ✓ |
+| 6 | `hard_force` | sentence-end EOS force | N/A |
+| 7 | `closing_inject` | closing phrase injection | — |
+| 8 | `closing_inject_trim` | closing phrase (reuses #7) | ✓ |
+
+Derived conditions (`*_trim`) reuse base generation text without re-running the model; they only re-evaluate with `trim_to_range` applied, then re-run `ends_with_sentence_punct` / `is_natural_ending` on the trimmed text.
+
+**`evaluate_output(eval_text, lower, upper, *, use_trim)`** — shared helper that computes all `GenResult` quality fields. `use_trim=False` evaluates raw text; `use_trim=True` applies `trim_to_range` first and re-evaluates quality on the trimmed text.
 
 **Acceptance criteria** — a sample is `accepted` only if all three hold:
-1. `trim_to_range` returns a result within `[lower, upper]`
-2. The raw output ends with a sentence-ending punctuation mark
-3. `is_natural_ending` returns `True`
+- `use_trim=False`: raw text is within `[lower, upper]`; `use_trim=True`: `trim_to_range` succeeds
+- The delivered text ends with a sentence-ending punctuation mark
+- `is_natural_ending` returns `True`
 
 **Reproducibility** — `derive_seed(base_seed, task_i, k)` produces a condition-independent seed (paired across conditions). `transformers_set_seed(seed)` is called at the start of each `generate_one` / `generate_one_with_closing`. MPS reproducibility is best-effort.
 
@@ -76,4 +86,4 @@ In `run_experiment.py`:
 - `BASE_SEED` — default `1234`, also settable via `--seed`
 - `CharRangeProcessor.__init__`: `soft_frac` (default 0.7), `boost` (default 4.0)
 - CLI `--k N` — target samples per condition per task (cumulative)
-- `TASKS` list — each entry is `(text, lower, upper)`; changing text changes `task_hash` and separates old/new records in the store
+- `TASKS` list — each entry is `(text, lower, upper)` with lower = upper × 0.8; changing text changes `task_hash` and separates old/new records in the store. task4 uses lower=52 < TRIGGER_MARGIN=55 to exercise the short-closing-text branch in `generate_one_with_closing`.

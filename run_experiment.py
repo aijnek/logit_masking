@@ -7,11 +7,15 @@
   - 上限 U : nonspace_len によるハードマスクで構造保証 ＋ ソフト EOS ブーストで自然収束
   - 後段   : 文境界トリムで上限を最終保証。範囲外なら再生成。
 
-比較できる条件:
-  baseline    : 介入なし（プロンプトのみ＝現状の素の best-of-N 相当）
-  hard_only   : 上限ハードマスク ＋ 下限 EOS 禁止（ソフトブーストなし）
-  hard_soft   : hard_only ＋ ソフト EOS ブースト
-  floor_sent  : 下限 EOS 禁止 ＋ 弱いソフトブースト（下限直後から）＋ 文末強制 EOS（ハードマスクなし）
+比較できる条件（8条件。下限制御は全条件 hard フロア共通）:
+  baseline          : 介入なし（素の出力で評価）
+  baseline_trim     : baseline の出力をトリム後に再評価（要約再生成なし）
+  hard_hard         : 上限ハードマスク ＋ 下限 EOS 禁止（旧 hard_only）
+  hard_soft         : 下限 EOS 禁止 ＋ 上限ソフトブースト（ハードマスクなし）
+  hard_soft_trim    : hard_soft の出力をトリム後に再評価（要約再生成なし）
+  hard_force        : 下限 EOS 禁止 ＋ 文末 EOS 強制（旧 floor_sent）
+  closing_inject    : 締め句注入
+  closing_inject_trim : closing_inject の出力をトリム後に再評価（要約再生成なし）
 
 文字数定義: 空白を除く Unicode コードポイント数（全角/半角の区別なし・記号は数える）。
 
@@ -395,9 +399,54 @@ class SampleRecord:
     elapsed: float
 
 
+def evaluate_output(eval_text: str, lower: int, upper: int, *, use_trim: bool) -> dict:
+    """合否判定ヘルパ。GenResult のフィールド値（text/injected/visible 以外）を辞書で返す。
+
+    use_trim=False : trim なし。eval_text そのままで raw_in_range ＋ 品質判定。
+    use_trim=True  : trim あり。trim 後テキストで文末記号・自然さを再評価。
+    """
+    raw_n = count_chars(eval_text)
+    raw_in_range = lower <= raw_n <= upper
+
+    if use_trim:
+        trim_result = trim_to_range(eval_text, lower, upper)  # None = 収まらず
+        needed_trim = (trim_result is not None) and (raw_n > upper)
+        delivered = trim_result if trim_result is not None else eval_text
+        trim_succeeded = trim_result is not None
+    else:
+        trim_result = None
+        needed_trim = False
+        delivered = eval_text
+        trim_succeeded = True  # trim しないので raw 判定
+
+    ewp = ends_with_sentence_punct(delivered)
+    if ewp:
+        is_nat, nat_raw = is_natural_ending(delivered)
+    else:
+        is_nat, nat_raw = None, None
+
+    if use_trim:
+        accepted = trim_succeeded and ewp and (is_nat is True)
+    else:
+        accepted = raw_in_range and ewp and (is_nat is True)
+
+    return dict(
+        raw_chars=raw_n,
+        raw_in_range=raw_in_range,
+        trimmed=delivered,
+        trimmed_chars=count_chars(delivered),
+        accepted=accepted,
+        needed_trim=needed_trim,
+        ends_with_punct=ewp,
+        is_natural=is_nat,
+        natural_raw=nat_raw,
+    )
+
+
 @torch.no_grad()
 def generate_one(text, lower, upper, *, hard, soft, floor,
                  soft_frac=0.7, boost=4.0, sent_end_force=False,
+                 use_trim=False,
                  temperature=0.7, top_p=0.8, seed: int | None = None) -> GenResult:
     if seed is not None:
         transformers_set_seed(seed)
@@ -426,37 +475,15 @@ def generate_one(text, lower, upper, *, hard, soft, floor,
     gen_ids = out[0, prompt_len:]
     raw = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
 
-    raw_n = count_chars(raw)
-    raw_in_range = lower <= raw_n <= upper
-
-    trimmed = trim_to_range(raw, lower, upper)
-
-    ewp = ends_with_sentence_punct(raw)
-    if ewp:
-        is_nat, nat_raw = is_natural_ending(raw)
-    else:
-        is_nat, nat_raw = None, None
-
-    accepted = (trimmed is not None) and ewp and (is_nat is True)
-    trimmed_text = trimmed if trimmed is not None else raw
-    return GenResult(
-        text=raw,
-        raw_chars=raw_n,
-        raw_in_range=raw_in_range,
-        trimmed=trimmed_text,
-        trimmed_chars=count_chars(trimmed_text),
-        accepted=accepted,
-        needed_trim=(trimmed is not None) and (raw_n > upper),
-        ends_with_punct=ewp,
-        is_natural=is_nat,
-        natural_raw=nat_raw,
-    )
+    ev = evaluate_output(raw, lower, upper, use_trim=use_trim)
+    return GenResult(text=raw, **ev)
 
 
 @torch.no_grad()
 def generate_one_with_closing(text, lower, upper, *,
                               trigger_margin=TRIGGER_MARGIN,
                               closing=CLOSING_TEXT,
+                              use_trim=False,
                               temperature=0.7, top_p=0.8,
                               seed: int | None = None) -> GenResult:
     """締め句注入方式の2段階生成。
@@ -552,44 +579,37 @@ def generate_one_with_closing(text, lower, upper, *,
     raw = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
     vis = visible_text(raw, closing)
 
-    vis_n = count_chars(vis)
-    vis_in_range = lower <= vis_n <= upper
-    trimmed = trim_to_range(vis, lower, upper)
-    ewp = ends_with_sentence_punct(vis)
-    if ewp:
-        is_nat, nat_raw = is_natural_ending(vis)
-    else:
-        is_nat, nat_raw = None, None
-
-    accepted = (trimmed is not None) and ewp and (is_nat is True)
-    trimmed_text = trimmed if trimmed is not None else vis
-    return GenResult(
-        text=raw,
-        raw_chars=vis_n,
-        raw_in_range=vis_in_range,
-        trimmed=trimmed_text,
-        trimmed_chars=count_chars(trimmed_text),
-        accepted=accepted,
-        needed_trim=(trimmed is not None) and (vis_n > upper),
-        ends_with_punct=ewp,
-        is_natural=is_nat,
-        natural_raw=nat_raw,
-        injected=injected,
-        visible=vis,
-    )
+    ev = evaluate_output(vis, lower, upper, use_trim=use_trim)
+    return GenResult(text=raw, **ev, injected=injected, visible=vis)
 
 
 # ----------------------------------------------------------------------------
 # 実験ハーネス: 条件ごとに K サンプルを取り、合格率と必要 N を比較
 # ----------------------------------------------------------------------------
+# 生成フラグ。mode="plain" → generate_one / mode="closing" → generate_one_with_closing
+# 下限制御は全条件で hard フロア（floor=True）共通。upper 制御方式で命名する対称スキーム。
+GEN_FLAGS = {
+    "baseline":       dict(mode="plain",   hard=False, soft=False, floor=False),
+    "hard_hard":      dict(mode="plain",   hard=True,  soft=False, floor=True),
+    "hard_soft":      dict(mode="plain",   hard=False, soft=True,  floor=True),
+    "hard_force":     dict(mode="plain",   hard=False, soft=True,  floor=True,
+                           soft_frac=0.0, boost=1.5, sent_end_force=True),
+    "closing_inject": dict(mode="closing", trigger_margin=TRIGGER_MARGIN, closing=CLOSING_TEXT),
+}
+
+# 実験条件（8条件）。
+#   gen     : 生成方式（GEN_FLAGS のキー）— base 条件
+#   derived : 再利用元 base 条件名 — derived 条件（要約は再生成しない）
+#   trim    : True = evaluate_output(use_trim=True)、False = raw/vis で評価（trim N/A 条件も False）
 CONDITIONS = {
-    "baseline":   dict(hard=False, soft=False, floor=False),
-    "hard_only":  dict(hard=True,  soft=False, floor=True),
-    "hard_soft":  dict(hard=True,  soft=True,  floor=True),
-    "floor_sent": dict(hard=False, soft=True,  floor=True,
-                       soft_frac=0.0, boost=1.5, sent_end_force=True),
-    "closing_inject": {"__mode__": "closing",
-                       "trigger_margin": TRIGGER_MARGIN, "closing": CLOSING_TEXT},
+    "baseline":            dict(gen="baseline",       trim=False),
+    "baseline_trim":       dict(derived="baseline",   trim=True),
+    "hard_hard":           dict(gen="hard_hard",      trim=False),  # ハードマスクで trim は理論上 N/A
+    "hard_soft":           dict(gen="hard_soft",      trim=False),
+    "hard_soft_trim":      dict(derived="hard_soft",  trim=True),
+    "hard_force":          dict(gen="hard_force",     trim=False),  # 文末強制 EOS で trim は理論上 N/A
+    "closing_inject":      dict(gen="closing_inject", trim=False),
+    "closing_inject_trim": dict(derived="closing_inject", trim=True),
 }
 
 
@@ -765,17 +785,33 @@ def run_experiment(tasks, *, target_k: int, conditions: list[str],
     - ストアから既存レコードをロードし、不足分のみ生成して追記する。
     - K を増やすと過去結果を再利用し、増分のみ生成する。
     - 同じ (cond, task_i, k, seed) のレコードは skip する（dedupe）。
+    - derived 条件（*_trim）は base 条件の生成テキストを再利用して trim + 品質再評価のみ実施
+      （要約の再生成なし）。derived が選択されているのに base 未選択なら base を自動追加する。
     """
     records, existing_keys = load_store(store_path)
 
-    # 今回生成するセル一覧（condとtask_iのフィルタ適用後）
-    active_conds = [(c, f) for c, f in CONDITIONS.items() if c in conditions]
+    # --- アクティブ条件を解決 ---
+    req = [c for c in conditions if c in CONDITIONS]
+    # derived 条件が選ばれているのに base が未選択なら自動追加
+    auto_bases: list[str] = []
+    for c in req:
+        cfg = CONDITIONS[c]
+        if "derived" in cfg:
+            base = cfg["derived"]
+            if base not in req and base not in auto_bases:
+                auto_bases.append(base)
+
+    # 実行順: 自動追加 base → 手動選択 base → derived（derived は base レコードに依存）
+    user_bases   = [c for c in req if "gen"     in CONDITIONS[c]]
+    user_derived = [c for c in req if "derived" in CONDITIONS[c]]
+    ordered_conds = auto_bases + user_bases + user_derived
+
     active_tasks = [(ti, *tasks[ti - 1]) for ti in task_indices]
 
-    # 生成が必要なセル数を計算
+    # 生成が必要なセル数を計算（base/derived 両方）
     needed = sum(
         1
-        for cond, _ in active_conds
+        for cond in ordered_conds
         for ti, text, lower, upper in active_tasks
         for k in range(1, target_k + 1)
         if record_key({
@@ -787,10 +823,20 @@ def run_experiment(tasks, *, target_k: int, conditions: list[str],
     grand_total = needed
     grand_done = 0
 
-    n_cond = len(active_conds)
-    for cond_i, (cond, flags) in enumerate(active_conds, 1):
-        print(f"\n[{cond_i}/{n_cond}] condition={cond}  (target_k={target_k})")
+    # derived 条件が base レコードを参照するためのマップ
+    records_lookup: dict[tuple, SampleRecord] = {
+        (r.cond, r.task_i, r.k): r for r in records
+    }
+
+    n_cond = len(ordered_conds)
+    for cond_i, cond in enumerate(ordered_conds, 1):
+        cfg = CONDITIONS[cond]
+        is_derived = "derived" in cfg
+
+        label = f"  [derives from: {cfg['derived']}]" if is_derived else ""
+        print(f"\n[{cond_i}/{n_cond}] condition={cond}  (target_k={target_k}){label}")
         t0 = time.time()
+
         for ti, text, lower, upper in active_tasks:
             for k in range(1, target_k + 1):
                 seed = derive_seed(base_seed, ti, k)
@@ -803,12 +849,40 @@ def run_experiment(tasks, *, target_k: int, conditions: list[str],
                     continue  # 既存 skip
 
                 t_s = time.time()
-                gen_kwargs = dict(temperature=temperature, top_p=top_p, seed=seed)
-                if flags.get("__mode__") == "closing":
-                    f = {k2: v for k2, v in flags.items() if k2 != "__mode__"}
-                    r = generate_one_with_closing(text, lower, upper, **f, **gen_kwargs)
+
+                if is_derived:
+                    # base 条件のテキストを再利用して trim + 品質再評価（要約再生成なし）
+                    base_cond = cfg["derived"]
+                    base_rec = records_lookup.get((base_cond, ti, k))
+                    if base_rec is None:
+                        print(f"  WARNING: base ({base_cond}, task{ti}, k={k}) が未生成 — skip")
+                        continue
+                    # closing 系は可視テキスト（締め句除去後）を評価テキストとして使う
+                    if CONDITIONS[base_cond].get("gen") == "closing_inject":
+                        eval_text = base_rec.result.visible or base_rec.result.text
+                    else:
+                        eval_text = base_rec.result.text
+                    ev = evaluate_output(eval_text, lower, upper, use_trim=True)
+                    r = GenResult(
+                        text=base_rec.result.text,
+                        **ev,
+                        injected=base_rec.result.injected,
+                        visible=base_rec.result.visible,
+                    )
                 else:
-                    r = generate_one(text, lower, upper, **flags, **gen_kwargs)
+                    # 通常の生成
+                    flags = GEN_FLAGS[cfg["gen"]]
+                    use_trim = cfg["trim"]
+                    gen_kwargs = dict(temperature=temperature, top_p=top_p, seed=seed)
+                    if flags["mode"] == "closing":
+                        f = {k2: v for k2, v in flags.items() if k2 != "mode"}
+                        r = generate_one_with_closing(
+                            text, lower, upper, **f, use_trim=use_trim, **gen_kwargs)
+                    else:
+                        f = {k2: v for k2, v in flags.items() if k2 != "mode"}
+                        r = generate_one(
+                            text, lower, upper, **f, use_trim=use_trim, **gen_kwargs)
+
                 elapsed = time.time() - t_s
                 grand_done += 1
 
@@ -819,6 +893,7 @@ def run_experiment(tasks, *, target_k: int, conditions: list[str],
                 append_record(store_path, row)
                 existing_keys.add(key)
                 records.append(rec)
+                records_lookup[(cond, ti, k)] = rec
 
                 status = "OK" if r.accepted else "NG"
                 trim_flag = " trim" if r.needed_trim else "     "
@@ -839,6 +914,7 @@ def run_experiment(tasks, *, target_k: int, conditions: list[str],
                     f" [{lower},{upper}]  {status}{trim_flag}{qual_flag}"
                     f"  {elapsed:.1f}s  [overall {grand_done}/{grand_total}]"
                 )
+
         dt = time.time() - t0
         print(f"  → condition={cond} done in {dt:.0f}s")
 
@@ -1034,12 +1110,13 @@ SAMPLE = (
     "本手法は追加の学習を要さず、推論時のロジット操作のみで実現できる点で実用的である。"
 )
 # SAMPLE: 1028文字（非空白）
-# (text, lower, upper)。下限は上限の0.7倍を想定（例: 200→140）
+# (text, lower, upper)。下限は上限の0.8倍を想定（例: 200→160）
+# task4 のみ lower=52 < TRIGGER_MARGIN=55 のため closing の短締め句ブランチ（CLOSING_TEXT_SHORT）が発動する。
 TASKS = [
-    (SAMPLE, 280, 400),   # task 1
-    (SAMPLE, 140, 200),   # task 2
-    (SAMPLE, 70, 100),    # task 3
-    (SAMPLE, 49, 70),     # task 4
+    (SAMPLE, 320, 400),   # task 1
+    (SAMPLE, 160, 200),   # task 2
+    (SAMPLE, 80, 100),    # task 3
+    (SAMPLE, 52, 65),     # task 4 (lower < TRIGGER_MARGIN → 短締め句ブランチ)
 ]
 
 
