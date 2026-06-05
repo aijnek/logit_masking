@@ -7,9 +7,10 @@
   - 上限 U : nonspace_len によるハードマスクで構造保証 ＋ ソフト EOS ブーストで自然収束
   - 後段   : 文境界トリムで上限を最終保証。範囲外なら再生成。
 
-比較できる条件（8条件。下限制御は全条件 hard フロア共通）:
+比較できる条件（下限制御は全条件 hard フロア共通）:
   baseline          : 介入なし（素の出力で評価）
   baseline_trim     : baseline の出力をトリム後に再評価（要約再生成なし）
+  lower_only        : 下限 EOS 禁止のみ（上限制御なし。baseline と hard_hard の中間）
   hard_hard         : 上限ハードマスク ＋ 下限 EOS 禁止（旧 hard_only）
   hard_soft         : 下限 EOS 禁止 ＋ 上限ソフトブースト（ハードマスクなし）
   hard_soft_trim    : hard_soft の出力をトリム後に再評価（要約再生成なし）
@@ -63,6 +64,9 @@ BASE_SEED = 1234  # --seed で上書き可。条件間でペア化（task_i, k �
 # 永続結果ストア
 STORE_PATH = "results.jsonl"
 SCHEMA_VERSION = 1
+
+# 最後の1文引き直し（regen 後処理）の上限試行回数
+MAX_REGEN_RETRIES = 3
 
 # 締め句注入方式 (closing_inject)
 CLOSING_TEXT = "最後に1文でまとめます。"
@@ -369,7 +373,12 @@ def build_prompt(text: str, lower: int, upper: int) -> str:
         {"role": "user", "content":
             f"次の文章を{lower}〜{upper}文字（空白を除く）で要約してください。"
             f"結論を先に書き、指定文字数に収めてください。"
-            f"要約後の文章のみを出力してください。文字数表示は不要です。\n\n{text}"},
+            f"要約後の文章のみを出力してください。"
+            f"\n\n{text}"
+            f"\n\n## 重要 ##\n"
+            f"出力するのは要約テキストのみ。"
+            f"文字数・文字数計算・「（〇〇文字）」のような注釈・合計文字数の説明など、"
+            f"要約テキスト以外の情報は一切出力しないこと。"},
     ]
     return tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True,
@@ -391,6 +400,8 @@ class GenResult:
     natural_raw: str | None       # raw model output from is_natural_ending; None if not called
     injected: bool | None = None  # closing_inject 条件のみ True/False、他条件は None
     visible: str | None = None    # 締め句除去後の可視テキスト（closing_inject のみ）
+    outcome: str | None = None    # first_pass / trim / regen_1.. / fallback (regen 条件のみ)
+    regen_k: int | None = None    # 引き直し試行回数（0=不要, None=非該当条件）
 
 
 @dataclass
@@ -446,6 +457,164 @@ def evaluate_output(eval_text: str, lower: int, upper: int, *, use_trim: bool) -
         is_natural=is_nat,
         natural_raw=nat_raw,
     )
+
+
+@torch.no_grad()
+def regenerate_last_sentence(body: str, lower: int, upper: int, *,
+                             seed: int | None = None,
+                             temperature: float = 0.7, top_p: float = 0.8,
+                             shorten: bool = False) -> str:
+    """締めの1文を生成して返す（本文は含まない）。
+
+    shorten=False（通常）:
+        body に続く締めの1文を新たに生成して返す。
+        文字数制約は生成する1文自体に課す（lo_needed〜up_needed = 全体帯 - body_n）。
+
+    shorten=True（1文が上限超えのとき）:
+        body（= 上限超えの1文）を所望の文字数に短く書き直した文を返す。
+        文字数制約は書き直し後のテキスト全体に課す（lo_needed=lower, up_needed=upper）。
+    """
+    if seed is not None:
+        transformers_set_seed(seed)
+
+    body_n = count_chars(body)
+    mid = round((lower + upper) / 2)
+
+    _output_only = (
+        "\n\n## 重要 ##\n"
+        "出力するのは要約テキストのみ。"
+        "文字数・文字数計算・「（〇〇文字）」のような注釈・合計文字数の説明など、"
+        "要約テキスト以外の情報は一切出力しないこと。"
+    )
+
+    if shorten:
+        target = mid
+        lo_needed = lower
+        up_needed = upper
+        user_content = (
+            f"以下の文を、意味と自然な日本語を保ちながら約{target}文字（空白を除く）に"
+            f"短く書き直してください。{lower}〜{upper}文字に収め、"
+            f"書き直した文のみを出力してください。"
+            f"\n\n文:\n{body}"
+            + _output_only
+        )
+    else:
+        target = max(1, mid - body_n)
+        lo_needed = max(0, lower - body_n)
+        up_needed = max(lo_needed, upper - body_n)
+        user_content = (
+            f"以下は要約の途中までの本文です。これに続けて全体を自然に締めくくる"
+            f"最後の1文だけを書いてください。\n"
+            f"最後の1文は約{target}文字（空白を除く）で、"
+            f"本文と合わせて{lower}〜{upper}文字に収めてください。\n"
+            f"本文は繰り返さず、続きの1文のみを出力してください。"
+            f"\n\n本文:\n{body}"
+            + _output_only
+        )
+
+    messages = [
+        {"role": "system", "content": "あなたは優秀な要約者です。"},
+        {"role": "user", "content": user_content},
+    ]
+    prompt = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    enc = tokenizer(prompt, return_tensors="pt").to(DEVICE)
+    prompt_len = enc.input_ids.shape[1]
+
+    processors = [CharRangeProcessor(
+        lo_needed, up_needed, prompt_len, tokenizer, NONSPACE_LEN, STOP_IDS,
+        use_hard_mask=False,
+        use_soft_boost=False,
+        use_lower_floor=(lo_needed > 0),
+        use_sent_end_force=True,
+    )]
+
+    out = model.generate(
+        **enc,
+        max_new_tokens=max(32, up_needed * 2 + 32),
+        do_sample=True,
+        temperature=temperature,
+        top_p=top_p,
+        logits_processor=processors,
+        eos_token_id=STOP_IDS if STOP_IDS else None,
+        pad_token_id=tokenizer.eos_token_id,
+    )
+    sentence = tokenizer.decode(out[0, prompt_len:], skip_special_tokens=True).strip()
+    return sentence
+
+
+def evaluate_with_regen(eval_text: str, lower: int, upper: int, *,
+                        seed: int,
+                        temperature: float = 0.7, top_p: float = 0.8,
+                        ) -> tuple[dict, str, int]:
+    """regen 条件用の評価オーケストレータ。
+
+    1. raw が帯内 → evaluate_output(use_trim=False)、outcome="first_pass"
+    2. trim 成功  → evaluate_output(use_trim=True)、outcome="trim"
+    3. trim 失敗  → 最後の1文を最大 MAX_REGEN_RETRIES 回引き直し
+       成功 → outcome="regen_{k}"
+       全失敗 → best-effort 出力で accepted=False、outcome="fallback"
+
+    返り値: (evaluate_output と同じ 9 キーの dict, outcome: str, regen_k: int)
+    regen_k は実際に引き直した回数（0 = 引き直し不要、>0 = 引き直し実施）。
+    """
+    raw_n = count_chars(eval_text)
+
+    # --- Case 1: raw が帯内 ---
+    if lower <= raw_n <= upper:
+        ev = evaluate_output(eval_text, lower, upper, use_trim=False)
+        return ev, "first_pass", 0
+
+    # --- Case 2: trim を試みる ---
+    trim_result = trim_to_range(eval_text, lower, upper)
+    if trim_result is not None:
+        ev = evaluate_output(eval_text, lower, upper, use_trim=True)
+        return ev, "trim", 0
+
+    # --- Case 3: trim でも救えない → 最後の1文を引き直し ---
+    # 本文 = 句点で終わるパートを上限を超えない範囲で貪欲に積む
+    parts = re.findall(r"[^。]*。|[^。]+$", eval_text)
+    body = ""
+    for p in parts:
+        candidate_body = body + p
+        # 句点で終わるパートのみを本文に積む（最後の断片は句点なし→除外）
+        if p.endswith("。") and count_chars(candidate_body) <= upper:
+            body = candidate_body
+        elif not p.endswith("。"):
+            # 末尾断片（句点なし）はスキップして引き直し対象とする
+            break
+        else:
+            # 句点で終わるが upper 超過 → ここで積むのをやめる
+            break
+    # body が空 = 最初の1文だけで上限超え → その1文自体を短縮する
+    single_sentence_overflow = not body
+    if single_sentence_overflow:
+        body = eval_text
+
+    last_ev = None
+    last_candidate = body
+    for retry_k in range(1, MAX_REGEN_RETRIES + 1):
+        sentence = regenerate_last_sentence(
+            body, lower, upper,
+            seed=seed + retry_k,
+            temperature=temperature,
+            top_p=top_p,
+            shorten=single_sentence_overflow,
+        )
+        # shorten=True のときは生成文がそのまま候補（body を連結しない）
+        candidate = sentence if single_sentence_overflow else body + sentence
+        ev = evaluate_output(candidate, lower, upper, use_trim=False)
+        last_ev = ev
+        last_candidate = candidate
+        if ev["accepted"]:
+            return ev, f"regen_{retry_k}", retry_k
+
+    # 全リトライ失敗 → best-effort
+    if last_ev is None:
+        last_ev = evaluate_output(last_candidate, lower, upper, use_trim=False)
+    return last_ev, "fallback", MAX_REGEN_RETRIES
 
 
 @torch.no_grad()
@@ -597,6 +766,7 @@ def generate_one_with_closing(text, lower, upper, *,
 # 下限制御は全条件で hard フロア（floor=True）共通。upper 制御方式で命名する対称スキーム。
 GEN_FLAGS = {
     "baseline":       dict(mode="plain",   hard=False, soft=False, floor=False),
+    "lower_only":     dict(mode="plain",   hard=False, soft=False, floor=True),
     "hard_hard":      dict(mode="plain",   hard=True,  soft=False, floor=True),
     "hard_soft":      dict(mode="plain",   hard=False, soft=True,  floor=True),
     "hard_force":     dict(mode="plain",   hard=False, soft=True,  floor=True,
@@ -613,6 +783,7 @@ GEN_FLAGS = {
 CONDITIONS = {
     "baseline":            dict(gen="baseline",       trim=False),
     "baseline_trim":       dict(derived="baseline",   trim=True),
+    "lower_only":          dict(gen="lower_only",     trim=False),
     "hard_hard":           dict(gen="hard_hard",      trim=False),  # ハードマスクで trim は理論上 N/A
     "hard_soft":           dict(gen="hard_soft",      trim=False),
     "hard_soft_trim":      dict(derived="hard_soft",  trim=True),
@@ -620,6 +791,7 @@ CONDITIONS = {
     "closing_inject":       dict(gen="closing_inject",       trim=False),
     "closing_inject_trim":  dict(derived="closing_inject",   trim=True),
     "closing_inject_force": dict(gen="closing_inject_force", trim=False),
+    "closing_inject_regen": dict(derived="closing_inject",   trim=True,  regen=True),
 }
 
 
@@ -660,6 +832,8 @@ def _row_to_sample_record(row: dict) -> "SampleRecord":
         natural_raw=r["natural_raw"],
         injected=r.get("injected"),
         visible=r.get("visible"),
+        outcome=r.get("outcome"),
+        regen_k=r.get("regen_k"),
     )
     return SampleRecord(
         cond=row["cond"],
@@ -872,13 +1046,30 @@ def run_experiment(tasks, *, target_k: int, conditions: list[str],
                         eval_text = base_rec.result.visible or base_rec.result.text
                     else:
                         eval_text = base_rec.result.text
-                    ev = evaluate_output(eval_text, lower, upper, use_trim=True)
-                    r = GenResult(
-                        text=base_rec.result.text,
-                        **ev,
-                        injected=base_rec.result.injected,
-                        visible=base_rec.result.visible,
-                    )
+                    if cfg.get("regen"):
+                        # regen 後処理: trim 失敗時のみ最後の1文を引き直す
+                        ev, outcome, regen_k = evaluate_with_regen(
+                            eval_text, lower, upper,
+                            seed=seed,
+                            temperature=temperature,
+                            top_p=top_p,
+                        )
+                        r = GenResult(
+                            text=base_rec.result.text,
+                            **ev,
+                            injected=base_rec.result.injected,
+                            visible=base_rec.result.visible,
+                            outcome=outcome,
+                            regen_k=regen_k,
+                        )
+                    else:
+                        ev = evaluate_output(eval_text, lower, upper, use_trim=True)
+                        r = GenResult(
+                            text=base_rec.result.text,
+                            **ev,
+                            injected=base_rec.result.injected,
+                            visible=base_rec.result.visible,
+                        )
                 else:
                     # 通常の生成
                     flags = GEN_FLAGS[cfg["gen"]]
@@ -919,9 +1110,12 @@ def run_experiment(tasks, *, target_k: int, conditions: list[str],
                         qual_flag = ""
                 else:
                     qual_flag = ""
+                outcome_flag = (f" [{r.outcome}]"
+                                if r.outcome and r.outcome not in ("first_pass", "trim")
+                                else "")
                 print(
                     f"  task{ti} k={k}/{target_k}  chars={r.trimmed_chars:>4}"
-                    f" [{lower},{upper}]  {status}{trim_flag}{qual_flag}"
+                    f" [{lower},{upper}]  {status}{trim_flag}{qual_flag}{outcome_flag}"
                     f"  {elapsed:.1f}s  [overall {grand_done}/{grand_total}]"
                 )
 
